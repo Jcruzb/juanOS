@@ -26,7 +26,11 @@ import { certificateSeverity, parseCertbotCertificates, parseCertbotDryRun } fro
 import { buildRecoveryManifest, validateRecoveryManifest } from "../src/recovery.js";
 import { readPersistedOutput } from "../src/deployment-ws.js";
 import { recoverInterruptedDeployments } from "../src/deployment-worker.js";
-import { availableSources, createLogSessionSchema } from "../src/operational-logs.js";
+import {
+  availableSources,
+  createLogSessionSchema,
+  observabilityProposal
+} from "../src/operational-logs.js";
 import { projectSchema } from "@juanos/shared";
 import { runHostAction } from "../src/host-operations.js";
 
@@ -258,6 +262,27 @@ test("logs operativos solo aceptan fuentes y límites enumerados", () => {
     config: { services: ["api", "worker"], nginx: { enabled: true } }
   });
   assert.deepEqual(sources.map((item) => item.id), ["docker_compose", "nginx_access", "nginx_error"]);
+  assert.equal(sources.every((item) => item.requiresAuthorization), true);
+});
+
+test("la autorización de observabilidad fija el servicio o Compose detectado", () => {
+  assert.deepEqual(observabilityProposal({
+    strategy: "systemd",
+    serviceName: "controlants-gunicorn.service",
+    config: {}
+  }), {
+    strategy: "systemd",
+    service: "controlants-gunicorn.service"
+  });
+  assert.deepEqual(observabilityProposal({
+    strategy: "docker_compose",
+    config: { composeFile: "docker-compose.yml", services: ["api", "worker"] }
+  }), {
+    strategy: "docker_compose",
+    composeFile: "docker-compose.yml",
+    services: ["api", "worker"]
+  });
+  assert.equal(observabilityProposal({ strategy: "pm2", config: {} }), null);
 });
 
 test("el alta valida estrategia, dominio, health y rutas relativas sin comandos", () => {
@@ -291,11 +316,18 @@ test("el alta valida estrategia, dominio, health y rutas relativas sin comandos"
 test("migraciones operativas modelan logs broker, puertos y recovery verificable", async () => {
   const operations = await fs.readFile(new URL("../migrations/003_operations.sql", import.meta.url), "utf8");
   const sessions = await fs.readFile(new URL("../migrations/004_operational_sessions.sql", import.meta.url), "utf8");
+  const authorizations = await fs.readFile(
+    new URL("../migrations/005_observability_authorizations.sql", import.meta.url),
+    "utf8"
+  );
   assert.match(operations, /CREATE TABLE port_reservations/);
   assert.match(operations, /CREATE TABLE deployment_artifacts/);
   assert.match(sessions, /CREATE TABLE operational_log_sessions/);
   assert.match(sessions, /verification_status/);
   assert.match(sessions, /CREATE TABLE system_observations/);
+  assert.match(authorizations, /CREATE TABLE host_observability_authorizations/);
+  assert.match(authorizations, /'queued', 'running', 'authorized', 'failed'/);
+  assert.match(authorizations, /host_observability_authorizations_queue_idx/);
 });
 
 test("sudo queda limitado al helper y nunca recibe contraseña o shell", async (context) => {
@@ -325,4 +357,38 @@ test("sudo queda limitado al helper y nunca recibe contraseña o shell", async (
   ]);
   assert.equal(invocation.args.some((value) => /password/i.test(value)), false);
   assert.equal(invocation.options.shell, undefined);
+});
+
+test("la autorización privilegiada solo recibe ruta, estrategia y servicio enumerados", async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "juanos-observability-helper-"));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const helper = path.join(root, "host-action");
+  await fs.writeFile(helper, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+  let invocation;
+  await runHostAction({
+    config: {
+      JUANOS_HOST_HELPER: helper,
+      JUANOS_HOST_HELPER_USE_SUDO: "1",
+      NODE_ENV: "test"
+    },
+    deployment: { slug: "back-controlants2-0" },
+    action: "authorize-observability",
+    parameters: {
+      "project-path": "/srv/juanos/projects/back-controlants2-0",
+      strategy: "systemd",
+      service: "controlants-gunicorn.service"
+    },
+    run(executable, args) {
+      invocation = { executable, args };
+      return Promise.resolve({ exitCode: 0 });
+    }
+  });
+  assert.equal(invocation.executable, "sudo");
+  assert.deepEqual(invocation.args, [
+    "-n", helper, "authorize-observability",
+    "--application", "back-controlants2-0",
+    "--project-path", "/srv/juanos/projects/back-controlants2-0",
+    "--strategy", "systemd",
+    "--service", "controlants-gunicorn.service"
+  ]);
 });

@@ -14,7 +14,7 @@ const safeCommand = z
 
 export const projectSchema = z.object({
   name: z.string().trim().min(2).max(80),
-  slug: z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/).max(80),
+  slug: z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/).max(63),
   localPath: z.string().startsWith("/").max(500),
   repositoryUrl: z.string().max(500).refine((value) => {
     if (/^git@[A-Za-z0-9.-]+:[A-Za-z0-9._/-]+(?:\.git)?$/.test(value)) return true;

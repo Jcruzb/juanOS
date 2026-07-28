@@ -53,8 +53,12 @@ export function createAuthRouter({ express, db, config, loginLimiter }) {
         if (user && !locked) {
           const failures = Number(user.failed_login_count) + 1;
           await db.query(
-            `UPDATE users SET failed_login_count = $2,
-             locked_until = CASE WHEN $2 >= $3 THEN now() + ($4 || ' minutes')::interval ELSE NULL END,
+            `UPDATE users SET failed_login_count = $2::integer,
+             locked_until = CASE
+               WHEN $2::integer >= $3::integer
+               THEN now() + ($4::integer * interval '1 minute')
+               ELSE NULL
+             END,
              updated_at = now() WHERE id = $1`,
             [user.id, failures, MAX_FAILURES, LOCK_MINUTES]
           );

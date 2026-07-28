@@ -229,6 +229,11 @@ export function createProjectsRouter({ express, db, config }) {
           [id, strategy, JSON.stringify({ serviceName: input.serviceName, ...(input.strategyConfig || {}) })]
         );
         await transaction.query(
+          `INSERT INTO host_observability_authorizations (application_id, status)
+           VALUES ($1,$2)`,
+          [id, input.isJuanOS ? "authorized" : ["systemd", "docker_compose"].includes(strategy) ? "required" : "not_required"]
+        );
+        await transaction.query(
           `INSERT INTO environments (application_id, name, is_default)
            VALUES ($1,'production',true)`,
           [id]

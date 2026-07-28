@@ -11,7 +11,7 @@ services:
       - postgres_data:/var/lib/postgresql/data
     ports:
       - "127.0.0.1:${POSTGRES_HOST_PORT:-5433}:5432"
-    networks: [private]
+    networks: [private, host_access]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U juanos -d juanos"]
       interval: 10s
@@ -67,7 +67,7 @@ services:
     build:
       context: .
       dockerfile: apps/web/Dockerfile
-    networks: [private]
+    networks: [private, host_access]
     ports:
       - "127.0.0.1:${WEB_HOST_PORT:-5173}:80"
     entrypoint: ["nginx", "-g", "daemon off;"]
@@ -83,6 +83,7 @@ services:
 networks:
   private:
     internal: true
+  host_access:
   egress:
 
 volumes:

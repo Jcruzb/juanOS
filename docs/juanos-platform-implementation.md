@@ -129,6 +129,12 @@ dos releases activas a la vez. Un índice único impide registrar dos aplicacion
 `/etc/juanos/host-policy.json`, también root-owned, y comprueba que cada servicio, contenedor,
 Compose file, dominio, ruta Nginx, release y backup pertenecen a la aplicación.
 
+Para aplicaciones systemd y Docker Compose importadas, la pestaña Logs permite solicitar una
+autorización de observabilidad. La API guarda una solicitud en PostgreSQL; el worker host valida
+mediante el helper que la ruta está bajo `PROJECTS_ROOT` y que el servicio o Compose existen. Solo
+entonces el helper actualiza atómicamente la política con acciones de estado y logs. La API no
+recibe permisos para escribir la política ni acceso a `docker.sock`.
+
 No acepta shell, comandos, rutas arbitrarias ni argumentos Docker genéricos. No expone `down -v`,
 `volume rm` ni `system prune`.
 
@@ -145,6 +151,8 @@ No hay contraseña sudo en HTTP, WebSocket, PostgreSQL, logs, archivos, argv o e
 - Fuentes: PM2, systemd, Docker Compose y Nginx access/error.
 - Servicios y paths salen de la configuración registrada/política; el frontend no puede elegir una
   ruta.
+- Las fuentes privilegiadas no abren una sesión hasta que el administrador confirma el servicio
+  detectado y el worker termina la autorización limitada.
 - 100, 500 o 1000 líneas; follow; pausa/reanudar; búsqueda; copia; fuente y servicio.
 - Sesiones con propietario, expiración, cancelación y auditoría.
 

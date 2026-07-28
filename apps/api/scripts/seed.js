@@ -86,6 +86,17 @@ async function seedApplication(input) {
       [applicationId, input.strategy, JSON.stringify({ serviceName: input.serviceName })]
     );
     await transaction.query(
+      `INSERT INTO host_observability_authorizations (application_id, status)
+       VALUES ($1,$2)
+       ON CONFLICT (application_id) DO NOTHING`,
+      [
+        applicationId,
+        input.isJuanOS
+          ? "authorized"
+          : ["systemd", "docker_compose"].includes(input.strategy) ? "required" : "not_required"
+      ]
+    );
+    await transaction.query(
       `INSERT INTO environments (application_id, name, is_default)
        VALUES ($1,'production',true) ON CONFLICT (application_id, name) DO NOTHING`,
       [applicationId]

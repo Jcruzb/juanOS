@@ -14,6 +14,31 @@ const createLogSessionSchema = z.object({
   lines: z.union([z.literal(100), z.literal(500), z.literal(1000)]).default(100),
   follow: z.boolean().default(true)
 });
+const authorizeObservabilitySchema = z.object({ confirm: z.literal(true) });
+const PRIVILEGED_LOG_SOURCES = new Set([
+  "systemd", "docker_compose", "nginx_access", "nginx_error"
+]);
+
+function authorizationStatus(application) {
+  if (application.authorizationStatus) return application.authorizationStatus;
+  if (application.isJuanOS) return "authorized";
+  return ["systemd", "docker_compose"].includes(application.strategy) ? "required" : "not_required";
+}
+
+export function observabilityProposal(application) {
+  if (application.strategy === "systemd") {
+    const service = application.config?.serviceName || application.serviceName;
+    if (!service) return null;
+    return { strategy: "systemd", service };
+  }
+  if (application.strategy === "docker_compose") {
+    const composeFile = application.config?.composeFile || "compose.yml";
+    const services = application.config?.services || [];
+    if (!services.length) return null;
+    return { strategy: "docker_compose", composeFile, services };
+  }
+  return null;
+}
 
 export function createOperationalLogsRouter({ express, db }) {
   const router = express.Router({ mergeParams: true });
@@ -22,12 +47,40 @@ export function createOperationalLogsRouter({ express, db }) {
     try {
       const applicationId = idSchema.parse(request.params.projectId);
       const result = await db.query(
-        `SELECT p.id, p.slug, p.service_name AS "serviceName",
+        `SELECT p.id, p.slug, p.is_juanos AS "isJuanOS", p.service_name AS "serviceName",
          ds.strategy, ds.config,
+         hoa.status AS "authorizationStatus", hoa.error AS "authorizationError",
+         hoa.config AS "authorizationConfig",
          COALESCE((
            SELECT json_agg(json_build_object('name', s.name, 'type', s.service_type))
            FROM application_services s WHERE s.application_id = p.id
          ), '[]'::json) AS services
+         FROM projects p
+         LEFT JOIN deployment_strategies ds ON ds.application_id = p.id
+         LEFT JOIN host_observability_authorizations hoa ON hoa.application_id = p.id
+         WHERE p.id = $1 AND p.is_active = true`,
+        [applicationId]
+      );
+      const application = result.rows[0];
+      if (!application) throw Object.assign(new Error("Aplicación no encontrada"), { status: 404 });
+      response.json({
+        sources: availableSources(application),
+        authorization: {
+          status: authorizationStatus(application),
+          error: application.authorizationError || null,
+          config: application.authorizationConfig || observabilityProposal(application)
+        }
+      });
+    } catch (error) { next(error); }
+  });
+
+  router.post("/authorization", requireCsrf, async (request, response, next) => {
+    try {
+      authorizeObservabilitySchema.parse(request.body);
+      const applicationId = idSchema.parse(request.params.projectId);
+      const result = await db.query(
+        `SELECT p.id, p.slug, p.local_path AS "localPath",
+         p.service_name AS "serviceName", ds.strategy, ds.config
          FROM projects p
          LEFT JOIN deployment_strategies ds ON ds.application_id = p.id
          WHERE p.id = $1 AND p.is_active = true`,
@@ -35,7 +88,31 @@ export function createOperationalLogsRouter({ express, db }) {
       );
       const application = result.rows[0];
       if (!application) throw Object.assign(new Error("Aplicación no encontrada"), { status: 404 });
-      response.json({ sources: availableSources(application) });
+      const proposal = observabilityProposal(application);
+      if (!proposal) {
+        throw Object.assign(new Error("La estrategia no requiere o no permite autorización automática"), {
+          status: 409,
+          code: "OBSERVABILITY_AUTHORIZATION_UNAVAILABLE"
+        });
+      }
+      const queued = await db.query(
+        `INSERT INTO host_observability_authorizations
+          (application_id, status, requested_by, config, error, requested_at, updated_at)
+         VALUES ($1,'queued',$2,$3::jsonb,NULL,now(),now())
+         ON CONFLICT (application_id) DO UPDATE SET
+          status = 'queued', requested_by = EXCLUDED.requested_by,
+          config = EXCLUDED.config, error = NULL, requested_at = now(),
+          started_at = NULL, authorized_at = NULL, updated_at = now()
+         RETURNING status, config`,
+        [applicationId, request.user.id, JSON.stringify(proposal)]
+      );
+      await writeAudit(db, request, {
+        action: "observability.authorization_requested",
+        resourceType: "application",
+        resourceId: applicationId,
+        metadata: proposal
+      });
+      response.status(202).json(queued.rows[0]);
     } catch (error) { next(error); }
   });
 
@@ -44,8 +121,11 @@ export function createOperationalLogsRouter({ express, db }) {
       const applicationId = idSchema.parse(request.params.projectId);
       const input = createLogSessionSchema.parse(request.body);
       const applicationResult = await db.query(
-        `SELECT p.id, p.slug, p.service_name AS "serviceName", ds.strategy, ds.config
-         FROM projects p LEFT JOIN deployment_strategies ds ON ds.application_id = p.id
+        `SELECT p.id, p.slug, p.service_name AS "serviceName", ds.strategy, ds.config,
+         hoa.status AS "authorizationStatus"
+         FROM projects p
+         LEFT JOIN deployment_strategies ds ON ds.application_id = p.id
+         LEFT JOIN host_observability_authorizations hoa ON hoa.application_id = p.id
          WHERE p.id = $1 AND p.is_active = true`,
         [applicationId]
       );
@@ -56,6 +136,12 @@ export function createOperationalLogsRouter({ express, db }) {
         throw Object.assign(new Error("Fuente de logs no configurada para la aplicación"), {
           status: 409,
           code: "LOG_SOURCE_NOT_CONFIGURED"
+        });
+      }
+      if (PRIVILEGED_LOG_SOURCES.has(input.source) && authorizationStatus(application) !== "authorized") {
+        throw Object.assign(new Error("Autoriza la observabilidad de esta aplicación antes de abrir logs"), {
+          status: 409,
+          code: "OBSERVABILITY_AUTHORIZATION_REQUIRED"
         });
       }
       const allowedServices = new Set([
@@ -104,13 +190,99 @@ export function createOperationalLogsRouter({ express, db }) {
 function availableSources(application) {
   const sources = [];
   if (application.strategy === "pm2") sources.push({ id: "pm2", label: "PM2", service: application.config?.processName });
-  if (application.strategy === "systemd") sources.push({ id: "systemd", label: "systemd", service: application.config?.serviceName || application.serviceName });
-  if (application.strategy === "docker_compose") sources.push({ id: "docker_compose", label: "Docker Compose", services: application.config?.services || [] });
+  if (application.strategy === "systemd") sources.push({
+    id: "systemd",
+    label: "systemd",
+    service: application.config?.serviceName || application.serviceName,
+    requiresAuthorization: true
+  });
+  if (application.strategy === "docker_compose") sources.push({
+    id: "docker_compose",
+    label: "Docker Compose",
+    services: application.config?.services || [],
+    requiresAuthorization: true
+  });
   if (application.config?.nginx?.enabled) {
-    sources.push({ id: "nginx_access", label: "Nginx access" });
-    sources.push({ id: "nginx_error", label: "Nginx error" });
+    sources.push({ id: "nginx_access", label: "Nginx access", requiresAuthorization: true });
+    sources.push({ id: "nginx_error", label: "Nginx error", requiresAuthorization: true });
   }
   return sources;
+}
+
+async function claimObservabilityAuthorization(db) {
+  return db.transaction(async (transaction) => {
+    const selected = await transaction.query(
+      `SELECT hoa.application_id AS "applicationId", hoa.config,
+       p.slug, p.local_path AS "localPath"
+       FROM host_observability_authorizations hoa
+       JOIN projects p ON p.id = hoa.application_id
+       WHERE hoa.status = 'queued'
+       ORDER BY hoa.requested_at
+       FOR UPDATE OF hoa SKIP LOCKED LIMIT 1`
+    );
+    const authorization = selected.rows[0];
+    if (!authorization) return null;
+    await transaction.query(
+      `UPDATE host_observability_authorizations
+       SET status = 'running', started_at = now(), updated_at = now()
+       WHERE application_id = $1`,
+      [authorization.applicationId]
+    );
+    return authorization;
+  });
+}
+
+function executeAuthorizationCommand(executable, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(executable, args, { ...options, shell: false });
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.on("data", (chunk) => { stdout = (stdout + chunk).slice(-100_000); });
+    child.stderr?.on("data", (chunk) => { stderr = (stderr + chunk).slice(-100_000); });
+    child.on("error", reject);
+    child.on("close", (exitCode) => {
+      if (exitCode === 0) resolve({ exitCode, stdout, stderr });
+      else reject(new Error(stderr.trim() || `${executable} terminó con código ${exitCode}`));
+    });
+  });
+}
+
+export async function runObservabilityAuthorizationWorkerOnce({ db, config }) {
+  const authorization = await claimObservabilityAuthorization(db);
+  if (!authorization) return false;
+  try {
+    const parameters = {
+      "project-path": authorization.localPath,
+      strategy: authorization.config.strategy
+    };
+    if (authorization.config.strategy === "systemd") {
+      parameters.service = authorization.config.service;
+    } else {
+      parameters["compose-file"] = authorization.config.composeFile;
+      parameters["compose-services"] = authorization.config.services.join(",");
+    }
+    await runHostAction({
+      config,
+      deployment: authorization,
+      action: "authorize-observability",
+      parameters,
+      run: executeAuthorizationCommand
+    });
+    await db.query(
+      `UPDATE host_observability_authorizations
+       SET status = 'authorized', error = NULL, authorized_at = now(), updated_at = now()
+       WHERE application_id = $1`,
+      [authorization.applicationId]
+    );
+  } catch (error) {
+    await db.query(
+      `UPDATE host_observability_authorizations
+       SET status = 'failed', error = $2, updated_at = now()
+       WHERE application_id = $1`,
+      [authorization.applicationId, redactSecrets(error.message).slice(0, 1000)]
+    );
+  }
+  return true;
 }
 
 async function claimLogSession(db, workerId) {
@@ -244,7 +416,8 @@ export function startOperationalLogWorker({ db, config }) {
     if (stopped) return;
     try {
       const handled = await runOperationalLogWorkerOnce({ db, config, workerId });
-      timer = setTimeout(tick, handled ? 50 : 1000);
+      const authorizationHandled = await runObservabilityAuthorizationWorkerOnce({ db, config });
+      timer = setTimeout(tick, handled || authorizationHandled ? 50 : 1000);
     } catch {
       timer = setTimeout(tick, 3000);
     }
@@ -254,7 +427,11 @@ export function startOperationalLogWorker({ db, config }) {
     `UPDATE operational_log_sessions SET status = 'failed',
      error = 'El worker anterior se interrumpió', finished_at = now()
      WHERE status = 'running'`
-  ).finally(tick);
+  ).then(() => db.query(
+    `UPDATE host_observability_authorizations SET status = 'failed',
+     error = 'El worker anterior se interrumpió', updated_at = now()
+     WHERE status = 'running'`
+  )).finally(tick);
   return async () => {
     stopped = true;
     if (timer) clearTimeout(timer);

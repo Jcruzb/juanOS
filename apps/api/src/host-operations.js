@@ -7,6 +7,7 @@ const HOST_ACTIONS = new Set([
   "systemd-restart",
   "systemd-status",
   "systemd-logs",
+  "authorize-observability",
   "docker-build",
   "docker-recreate",
   "docker-status",
@@ -31,7 +32,7 @@ const HOST_ACTIONS = new Set([
 const PARAMETER_NAMES = new Set([
   "service", "compose-file", "compose-service", "dockerfile", "image", "container",
   "port", "source", "commit", "deployment", "domain", "include-www", "lines",
-  "follow", "strategy", "release"
+  "follow", "strategy", "release", "project-path", "compose-services"
 ]);
 
 function parameterValue(value) {

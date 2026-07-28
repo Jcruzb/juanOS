@@ -9,6 +9,11 @@ const SAFE_NAME = /^[A-Za-z0-9][A-Za-z0-9_.@-]{0,127}$/;
 const SAFE_SLUG = /^[a-z0-9][a-z0-9-]{0,62}$/;
 const SAFE_COMMIT = /^[a-f0-9]{7,64}$/;
 const SAFE_LINES = new Set(["100", "500", "1000"]);
+const PROJECTS_ROOT = "/srv/juanos/projects";
+const OBSERVABILITY_ACTIONS = {
+  systemd: ["systemd-logs", "systemd-status"],
+  docker_compose: ["compose-logs", "compose-status"]
+};
 
 function fail(message, code = 2) {
   process.stderr.write(`${message}\n`);
@@ -45,6 +50,15 @@ function readPolicy() {
   return policy;
 }
 
+function writePolicy(policy) {
+  const policyPath = process.env.JUANOS_HOST_POLICY || POLICY_PATH;
+  const temporary = `${policyPath}.juanos-next`;
+  fs.writeFileSync(temporary, `${JSON.stringify(policy, null, 2)}\n`, { mode: 0o640 });
+  fs.chownSync(temporary, 0, 0);
+  fs.chmodSync(temporary, 0o640);
+  fs.renameSync(temporary, policyPath);
+}
+
 function realDirectory(value, label) {
   if (!path.isAbsolute(value)) fail(`${label} debe ser una ruta absoluta`);
   const stat = fs.lstatSync(value);
@@ -76,6 +90,23 @@ function safePort(value) {
   const port = Number(value);
   if (!Number.isInteger(port) || port < 1 || port > 65535) fail("Puerto no válido");
   return String(port);
+}
+
+function safeProjectDirectory(value) {
+  const projectsRoot = fs.realpathSync(PROJECTS_ROOT);
+  const project = realDirectory(value, "projectPath");
+  if (project === projectsRoot || !project.startsWith(`${projectsRoot}${path.sep}`)) {
+    fail("projectPath debe estar dentro de PROJECTS_ROOT");
+  }
+  return project;
+}
+
+function safeNameList(value, label) {
+  const values = String(value || "").split(",").filter(Boolean);
+  if (!values.length || values.length > 100 || values.some((item) => !SAFE_NAME.test(item))) {
+    fail(`${label} contiene valores no válidos`);
+  }
+  return [...new Set(values)];
 }
 
 function command(executable, args, options = {}) {
@@ -235,6 +266,9 @@ ${tlsServer}`;
 async function runAction(action, values, app) {
   const projectPath = realDirectory(app.projectPath, "projectPath");
   app.projectPath = projectPath;
+  if (Array.isArray(app.allowedActions) && !app.allowedActions.includes(action)) {
+    fail("Acción no autorizada para esta aplicación");
+  }
 
   if (action === "preflight") {
     const tools = new Set(["git"]);
@@ -460,11 +494,60 @@ async function runAction(action, values, app) {
   fail(`Acción host no soportada: ${action}`);
 }
 
+async function authorizeObservability(values, policy) {
+  const slug = values.application;
+  const projectPath = safeProjectDirectory(values["project-path"]);
+  const strategy = values.strategy;
+  const allowedActions = OBSERVABILITY_ACTIONS[strategy];
+  if (!allowedActions) fail("Estrategia de observabilidad no soportada");
+
+  const existing = policy.applications[slug];
+  const application = {
+    ...(existing || {}),
+    projectPath
+  };
+
+  if (strategy === "systemd") {
+    const service = values.service;
+    if (!service || !SAFE_NAME.test(service)) fail("Servicio systemd no válido");
+    const loaded = await command(
+      "systemctl",
+      ["show", "--property=LoadState", "--value", service],
+      { capture: true }
+    );
+    if (loaded.stdout.trim() !== "loaded") fail("El servicio systemd no existe o no está cargado");
+    application.systemd = { service };
+  } else {
+    const composeFile = values["compose-file"] || "compose.yml";
+    safeRelativeFile(projectPath, composeFile, "Compose file");
+    const services = safeNameList(values["compose-services"], "Servicios Compose");
+    application.compose = {
+      file: composeFile,
+      services,
+      service: services[0]
+    };
+  }
+
+  if (Array.isArray(existing?.allowedActions)) {
+    application.allowedActions = [...new Set([...existing.allowedActions, ...allowedActions])];
+  } else if (!existing) {
+    application.allowedActions = allowedActions;
+  }
+  application.observabilityManaged = true;
+  policy.applications[slug] = application;
+  writePolicy(policy);
+  process.stdout.write(`${JSON.stringify({ application: slug, strategy, allowedActions })}\n`);
+}
+
 const { action, values } = parseArguments(process.argv.slice(2));
 if (process.getuid?.() !== 0) fail("El helper privilegiado debe ejecutarse como root");
 if (!SAFE_SLUG.test(values.application || "")) fail("Slug de aplicación no válido");
 const policy = readPolicy();
-const application = policy.applications[values.application];
-if (!application) fail("Aplicación no autorizada por la política");
+if (action === "authorize-observability") {
+  authorizeObservability(values, policy).catch((error) => fail(error.message, 1));
+} else {
+  const application = policy.applications[values.application];
+  if (!application) fail("Aplicación no autorizada por la política");
 
-runAction(action, values, application).catch((error) => fail(error.message, 1));
+  runAction(action, values, application).catch((error) => fail(error.message, 1));
+}

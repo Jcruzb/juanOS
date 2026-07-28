@@ -16,7 +16,8 @@
 3. Ejecuta `sudo scripts/prepare-server.sh`.
 4. Si hace falta, ejecuta `sudo scripts/install-docker.sh`.
 5. Edita `/etc/juanos/compose.env` y `/etc/juanos/worker.env`.
-6. Edita `/etc/juanos/host-policy.json`; elimina el ejemplo y declara cada app real.
+6. Edita `/etc/juanos/host-policy.json`; elimina el ejemplo y declara JuanOS. Las aplicaciones
+   importadas pueden autorizar su observabilidad limitada desde la pestaña **Logs**.
 7. Configura recovery y self-update en `/etc/juanos`.
 8. Valida `sudo visudo -cf /etc/sudoers.d/juanos-host-helper`.
 9. Ejecuta las migraciones.
@@ -30,6 +31,27 @@ Los contenedores API/web solo publican puertos loopback; Nginx HTTPS vive en el 
 monta `docker.sock`. Las acciones privilegiadas pasan por
 `/usr/local/libexec/juanos-host-action`, que solo acepta operaciones enumeradas y comprueba la
 política root-owned.
+
+## Autorizar logs de una aplicación importada
+
+Las aplicaciones systemd y Docker Compose importadas aparecen inicialmente con observabilidad
+pendiente. En **Aplicación → Logs**, revisa el servicio o los servicios detectados y pulsa
+**Autorizar observabilidad**. El worker pide al helper root-owned que añada una entrada limitada a:
+
+- `systemd-status` y `systemd-logs`; o
+- `compose-status` y `compose-logs`.
+
+La aplicación debe residir bajo `PROJECTS_ROOT` y el helper comprueba que el servicio systemd
+existe o que el archivo Compose está dentro del proyecto. La API nunca edita directamente
+`/etc/juanos/host-policy.json`. Si la autorización falla, el motivo aparece en la misma pestaña.
+
+Al actualizar JuanOS, reinstala también el helper antes de reiniciar el worker:
+
+```text
+sudo install -o root -g root -m 0755 \
+  /opt/juanos/current/scripts/juanos-host-action \
+  /usr/local/libexec/juanos-host-action
+```
 
 ## Proyectos y permisos
 

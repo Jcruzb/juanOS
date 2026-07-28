@@ -358,6 +358,12 @@ input:focus { border-color: #7257db; box-shadow: 0 0 0 3px #7257db20; }
 .certificate-grid b.warning { color:#d0a45f; }
 .certificate-grid b.critical { color:#db6c6c; }
 .operational-logs { display:grid;gap:10px;min-width:0; }
+.observability-authorization { align-items:center; }
+.observability-authorization > div { display:grid;gap:3px;flex:1;min-width:180px; }
+.observability-authorization strong { color:#e0c396; }
+.observability-authorization span { color:#a89b86; }
+.observability-authorization code { color:#d2b17e;font-size:9px;overflow-wrap:anywhere; }
+.observability-authorization button { margin-left:auto; }
 .log-toolbar,.log-tools { display:flex;flex-wrap:wrap;gap:8px;align-items:center; }
 .log-toolbar select { min-width:130px; }
 .log-tools { justify-content:flex-end; }

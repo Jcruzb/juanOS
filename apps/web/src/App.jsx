@@ -635,10 +635,12 @@ function EnvironmentsView({ projects, initialProjectId = "" }) {
 }
 
 function OperationalLogsPanel({ projectId }) {
+  const queryClient = useQueryClient();
   const sources = useQuery({
     queryKey: ["log-sources", projectId],
     queryFn: () => api(`/projects/${projectId}/logs/sources`),
-    enabled: Boolean(projectId)
+    enabled: Boolean(projectId),
+    refetchInterval: 2000
   });
   const [source, setSource] = useState("");
   const [service, setService] = useState("");
@@ -651,9 +653,20 @@ function OperationalLogsPanel({ projectId }) {
   const pendingRef = useRef("");
   useEffect(() => { pausedRef.current = paused; }, [paused]);
   const sourceOptions = sources.data?.sources || [];
+  const authorization = sources.data?.authorization;
   const activeSource = source || sourceOptions[0]?.id || "";
   const selectedSource = sourceOptions.find((item) => item.id === activeSource);
   const activeService = service || selectedSource?.service || selectedSource?.services?.[0] || "";
+  const authorizationRequired = Boolean(
+    selectedSource?.requiresAuthorization && authorization?.status !== "authorized"
+  );
+  const authorize = useMutation({
+    mutationFn: () => api(`/projects/${projectId}/logs/authorization`, {
+      method: "POST",
+      body: JSON.stringify({ confirm: true })
+    }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["log-sources", projectId] })
+  });
   const start = useMutation({
     mutationFn: () => api(`/projects/${projectId}/logs/sessions`, {
       method: "POST",
@@ -689,10 +702,17 @@ function OperationalLogsPanel({ projectId }) {
           else setOutput((current) => (current + pendingRef.current + message.data).slice(-2_000_000));
           if (!pausedRef.current) pendingRef.current = "";
         }
-        if (message.type === "end") setSession((current) => current ? { ...current, status: message.status } : current);
+        if (message.type === "end") {
+          disposed = true;
+          if (message.error) {
+            setOutput((current) => `${current}${current ? "\n" : ""}Error: ${message.error}\n`);
+          }
+          setSession((current) => current ? { ...current, status: message.status } : current);
+          socket.close();
+        }
       };
       socket.onclose = () => {
-        if (!disposed && session.status !== "finished") retry = window.setTimeout(connect, 1000);
+        if (!disposed) retry = window.setTimeout(connect, 1000);
       };
     };
     connect();
@@ -701,7 +721,7 @@ function OperationalLogsPanel({ projectId }) {
       window.clearTimeout(retry);
       socket?.close();
     };
-  }, [session?.id, session?.status]);
+  }, [session?.id]);
   const filtered = query
     ? output.split("\n").filter((line) => line.toLowerCase().includes(query.toLowerCase())).join("\n")
     : output;
@@ -710,7 +730,33 @@ function OperationalLogsPanel({ projectId }) {
     pendingRef.current = "";
     setPaused(false);
   };
+  const emptyMessage = session
+    ? session.status === "running" || session.status === "queued"
+      ? "Esperando salida de la fuente autorizada…"
+      : `El stream terminó con estado ${session.status}.`
+    : "Selecciona una fuente y abre el stream.";
   return <section className="operational-logs">
+    {authorizationRequired && <div className="warning-box observability-authorization">
+      <AlertTriangle size={16} />
+      <div>
+        <strong>Observabilidad pendiente de autorización</strong>
+        <span>
+          {authorization?.status === "failed"
+            ? authorization.error || "La autorización falló."
+            : authorization?.status === "queued" || authorization?.status === "running"
+              ? "El worker está aplicando una política limitada de estado y logs."
+              : "Confirma el servicio detectado para permitir únicamente estado y logs desde JuanOS."}
+        </span>
+        <code>{activeService || authorization?.config?.composeFile || activeSource}</code>
+      </div>
+      <button
+        className="secondary-button"
+        disabled={authorize.isPending || ["queued", "running"].includes(authorization?.status)}
+        onClick={() => authorize.mutate()}
+      >
+        {["queued", "running"].includes(authorization?.status) ? "Autorizando…" : "Autorizar observabilidad"}
+      </button>
+    </div>}
     <div className="log-toolbar">
       <select value={activeSource} onChange={(event) => {
         const next = sources.data?.sources?.find((item) => item.id === event.target.value);
@@ -719,7 +765,7 @@ function OperationalLogsPanel({ projectId }) {
       }}>{(sources.data?.sources || []).map((item) => <option value={item.id} key={item.id}>{item.label}</option>)}</select>
       {(selectedSource?.services?.length || selectedSource?.service) && <select value={activeService} onChange={(event) => setService(event.target.value)}>{(selectedSource.services || [selectedSource.service]).filter(Boolean).map((name) => <option value={name} key={name}>{name}</option>)}</select>}
       <select value={lines} onChange={(event) => setLines(Number(event.target.value))}><option value={100}>100 líneas</option><option value={500}>500 líneas</option><option value={1000}>1000 líneas</option></select>
-      <button className="primary-button small" disabled={!activeSource || start.isPending} onClick={() => start.mutate()}><Play size={14} /> Abrir stream</button>
+      <button className="primary-button small" disabled={!activeSource || start.isPending || authorizationRequired} onClick={() => start.mutate()}><Play size={14} /> Abrir stream</button>
     </div>
     <div className="log-tools">
       <label><Search size={14} /><input placeholder="Buscar en logs" value={query} onChange={(event) => setQuery(event.target.value)} /></label>
@@ -727,8 +773,8 @@ function OperationalLogsPanel({ projectId }) {
       <button onClick={() => navigator.clipboard.writeText(filtered)}><Copy size={14} /> Copiar</button>
       {session && !["finished", "failed", "cancelled"].includes(session.status) && <button onClick={() => cancel.mutate()}><X size={14} /> Cerrar</button>}
     </div>
-    {(sources.error || start.error || cancel.error) && <p className="form-error">{(sources.error || start.error || cancel.error).message}</p>}
-    <pre className="live-log operational-output">{filtered || (sources.isPending ? "Buscando fuentes permitidas…" : "Selecciona una fuente. No se aceptan rutas arbitrarias.")}</pre>
+    {(sources.error || authorize.error || start.error || cancel.error) && <p className="form-error">{(sources.error || authorize.error || start.error || cancel.error).message}</p>}
+    <pre className="live-log operational-output">{filtered || (sources.isPending ? "Buscando fuentes permitidas…" : emptyMessage)}</pre>
   </section>;
 }
 

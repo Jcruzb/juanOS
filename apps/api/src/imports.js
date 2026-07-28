@@ -14,7 +14,7 @@ import {
 const importSchema = z.object({
   projectPath: z.string().startsWith("/").max(500),
   name: z.string().trim().min(2).max(80).optional(),
-  slug: z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/).max(80),
+  slug: z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/).max(63),
   repositoryUrl: z.string().max(500).refine((value) => {
     if (/^git@[A-Za-z0-9.-]+:[A-Za-z0-9._/-]+(?:\.git)?$/.test(value)) return true;
     try {
@@ -148,6 +148,11 @@ export function createImportsRouter({ express, db, config }) {
             composeFile: inspection.indicators.composeFile || undefined,
             services: inspection.indicators.composeServices || undefined
           })]
+        );
+        await transaction.query(
+          `INSERT INTO host_observability_authorizations (application_id, status)
+           VALUES ($1,$2)`,
+          [applicationId, ["systemd", "docker_compose"].includes(strategy) ? "required" : "not_required"]
         );
         const environment = await transaction.query(
           `INSERT INTO environments (application_id, name, is_default)
