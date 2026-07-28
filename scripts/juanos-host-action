@@ -1,0 +1,470 @@
+#!/usr/bin/env node
+
+import fs from "node:fs";
+import path from "node:path";
+import { spawn } from "node:child_process";
+
+const POLICY_PATH = "/etc/juanos/host-policy.json";
+const SAFE_NAME = /^[A-Za-z0-9][A-Za-z0-9_.@-]{0,127}$/;
+const SAFE_SLUG = /^[a-z0-9][a-z0-9-]{0,62}$/;
+const SAFE_COMMIT = /^[a-f0-9]{7,64}$/;
+const SAFE_LINES = new Set(["100", "500", "1000"]);
+
+function fail(message, code = 2) {
+  process.stderr.write(`${message}\n`);
+  process.exit(code);
+}
+
+function parseArguments(argv) {
+  const [action, ...rest] = argv;
+  const values = {};
+  for (let index = 0; index < rest.length; index += 2) {
+    const flag = rest[index];
+    const value = rest[index + 1];
+    if (!flag?.startsWith("--") || value === undefined || value.startsWith("--")) {
+      fail("Argumentos de helper no válidos");
+    }
+    const key = flag.slice(2);
+    if (values[key] !== undefined) fail(`Argumento duplicado: ${flag}`);
+    values[key] = value;
+  }
+  return { action, values };
+}
+
+function readPolicy() {
+  const policyPath = process.env.JUANOS_HOST_POLICY || POLICY_PATH;
+  const stat = fs.lstatSync(policyPath);
+  if (!stat.isFile() || stat.isSymbolicLink()) fail("La política del host no es un archivo regular");
+  if (stat.uid !== 0 || (stat.mode & 0o022) !== 0) {
+    fail("La política del host debe pertenecer a root y no ser modificable por grupo u otros");
+  }
+  const policy = JSON.parse(fs.readFileSync(policyPath, "utf8"));
+  if (policy.version !== 1 || !policy.applications || typeof policy.applications !== "object") {
+    fail("Política del host incompatible");
+  }
+  return policy;
+}
+
+function realDirectory(value, label) {
+  if (!path.isAbsolute(value)) fail(`${label} debe ser una ruta absoluta`);
+  const stat = fs.lstatSync(value);
+  if (stat.isSymbolicLink() || !stat.isDirectory()) fail(`${label} no es un directorio regular`);
+  return fs.realpathSync(value);
+}
+
+function safeRelativeFile(root, value, label, mustExist = true) {
+  if (!value || path.isAbsolute(value) || value.split(/[\\/]/).includes("..")) {
+    fail(`${label} no es una ruta relativa válida`);
+  }
+  const target = path.resolve(root, value);
+  if (target !== root && !target.startsWith(`${root}${path.sep}`)) fail(`${label} sale del proyecto`);
+  if (!mustExist) return target;
+  const real = fs.realpathSync(target);
+  if (real !== root && !real.startsWith(`${root}${path.sep}`)) fail(`${label} sale del proyecto`);
+  return real;
+}
+
+function safeConfiguredName(received, configured, label) {
+  const value = received || configured;
+  if (!value || !SAFE_NAME.test(value) || (received && configured && received !== configured)) {
+    fail(`${label} no está autorizado por la política`);
+  }
+  return value;
+}
+
+function safePort(value) {
+  const port = Number(value);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) fail("Puerto no válido");
+  return String(port);
+}
+
+function command(executable, args, options = {}) {
+  const child = spawn(executable, args, {
+    cwd: options.cwd,
+    env: {
+      PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      ...(options.env || {})
+    },
+    stdio: options.capture ? ["ignore", "pipe", "pipe"] : "inherit",
+    shell: false
+  });
+  for (const signal of ["SIGTERM", "SIGINT"]) {
+    process.once(signal, () => child.kill(signal));
+  }
+  return new Promise((resolve, reject) => {
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.on("data", (chunk) => { stdout = (stdout + chunk).slice(-1_000_000); });
+    child.stderr?.on("data", (chunk) => { stderr = (stderr + chunk).slice(-1_000_000); });
+    child.on("error", reject);
+    child.on("close", (exitCode) => {
+      if (exitCode === 0) resolve({ stdout, stderr });
+      else reject(new Error(`${executable} terminó con código ${exitCode}${stderr ? `: ${stderr}` : ""}`));
+    });
+  });
+}
+
+function linesAndFollow(values) {
+  const lines = values.lines || "100";
+  if (!SAFE_LINES.has(lines)) fail("Cantidad de líneas no permitida");
+  return { lines, follow: values.follow === "true" };
+}
+
+function composeTarget(app, values) {
+  const compose = app.compose || {};
+  const configuredFile = compose.file || "compose.yml";
+  const composeFile = values["compose-file"] || configuredFile;
+  if (composeFile !== configuredFile) fail("Compose file no autorizado");
+  return safeRelativeFile(app.projectPath, composeFile, "Compose file");
+}
+
+function configuredDomain(app, value) {
+  if (!value || !Array.isArray(app.domains) || !app.domains.includes(value)) {
+    fail("Dominio no autorizado por la política");
+  }
+  return value;
+}
+
+function nginxLocations(app) {
+  const nginx = app.nginx || {};
+  if (nginx.kind === "static") {
+    const root = nginx.root;
+    if (!path.isAbsolute(root || "") || !root.startsWith("/var/www/")) fail("Root Nginx no autorizado");
+    return `  root ${root};
+  index index.html;
+  location / { try_files $uri $uri/ /index.html; }`;
+  }
+  if (nginx.kind !== "proxy") fail("Tipo de upstream Nginx no configurado");
+  const webPort = safePort(nginx.webPort || nginx.upstreamPort);
+  const apiPort = nginx.apiPort ? safePort(nginx.apiPort) : null;
+  const apiLocations = apiPort ? `
+  location /api/ {
+    proxy_pass http://127.0.0.1:${apiPort};
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+  }
+  location /ws/ {
+    proxy_pass http://127.0.0.1:${apiPort};
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_set_header Origin $http_origin;
+    proxy_read_timeout 1h;
+    proxy_buffering off;
+  }` : "";
+  return `${apiLocations}
+  location / {
+    proxy_pass http://127.0.0.1:${webPort};
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+  }`;
+}
+
+function writeNginxConfig(app) {
+  const nginx = app.nginx || {};
+  const siteName = safeConfiguredName(null, nginx.siteName, "Sitio Nginx");
+  const domain = configuredDomain(app, nginx.domain || app.domains?.[0]);
+  const accessLog = nginx.accessLog || `/var/log/nginx/${siteName}.access.log`;
+  const errorLog = nginx.errorLog || `/var/log/nginx/${siteName}.error.log`;
+  const expectedPrefix = `/var/log/nginx/${siteName}`;
+  if (!accessLog.startsWith(expectedPrefix) || !errorLog.startsWith(expectedPrefix)) {
+    fail("Logs Nginx fuera del prefijo autorizado");
+  }
+  const certificateRoot = `/etc/letsencrypt/live/${domain}`;
+  const hasCertificate = fs.existsSync(path.join(certificateRoot, "fullchain.pem"))
+    && fs.existsSync(path.join(certificateRoot, "privkey.pem"));
+  const locations = nginxLocations(app);
+  const contentSecurityPolicy = nginx.securityHeaders
+    ? `  add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com 'unsafe-inline'; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self' wss:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'" always;`
+    : "";
+  const httpBehavior = hasCertificate
+    ? "  location / { return 301 https://$host$request_uri; }"
+    : locations;
+  const tlsServer = hasCertificate ? `
+server {
+  listen 443 ssl http2;
+  listen [::]:443 ssl http2;
+  server_name ${domain};
+  access_log ${accessLog};
+  error_log ${errorLog};
+  ssl_certificate ${certificateRoot}/fullchain.pem;
+  ssl_certificate_key ${certificateRoot}/privkey.pem;
+  ssl_protocols TLSv1.2 TLSv1.3;
+  add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+  add_header X-Content-Type-Options nosniff always;
+  add_header X-Frame-Options DENY always;
+  add_header Referrer-Policy no-referrer always;
+  add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+${contentSecurityPolicy}
+${locations}
+}
+` : "";
+  const content = `server {
+  listen 80;
+  listen [::]:80;
+  server_name ${domain};
+  access_log ${accessLog};
+  error_log ${errorLog};
+  location /.well-known/acme-challenge/ { root /var/www/certbot; }
+${httpBehavior}
+}
+${tlsServer}`;
+  const available = `/etc/nginx/sites-available/${siteName}`;
+  const enabled = `/etc/nginx/sites-enabled/${siteName}`;
+  const temporary = `${available}.juanos-next`;
+  fs.writeFileSync(temporary, content, { mode: 0o644 });
+  fs.renameSync(temporary, available);
+  try {
+    const link = fs.lstatSync(enabled);
+    if (!link.isSymbolicLink()) fail("La entrada sites-enabled existente no es un symlink");
+    fs.unlinkSync(enabled);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  fs.symlinkSync(available, enabled);
+  return available;
+}
+
+async function runAction(action, values, app) {
+  const projectPath = realDirectory(app.projectPath, "projectPath");
+  app.projectPath = projectPath;
+
+  if (action === "preflight") {
+    const tools = new Set(["git"]);
+    const strategy = values.strategy;
+    if (strategy === "pm2") tools.add("pm2");
+    if (strategy === "systemd") tools.add("systemctl");
+    if (strategy === "docker" || strategy === "docker_compose") tools.add("docker");
+    if (app.nginx) tools.add("nginx");
+    for (const tool of tools) await command("/usr/bin/env", ["which", tool]);
+    return;
+  }
+  if (action === "port-check") {
+    const port = safePort(values.port);
+    const result = await command("ss", ["-H", "-ltn", `sport = :${port}`], { capture: true });
+    if (result.stdout.trim()) fail(`El puerto ${port} ya está ocupado`, 3);
+    process.stdout.write(`Puerto ${port} disponible\n`);
+    return;
+  }
+  if (action === "port-listening") {
+    const port = safePort(values.port);
+    const result = await command("ss", ["-H", "-ltn", `sport = :${port}`], { capture: true });
+    if (!result.stdout.trim()) fail(`El puerto ${port} no está escuchando`, 3);
+    process.stdout.write(`Puerto ${port} escuchando\n`);
+    return;
+  }
+  if (action === "systemd-restart") {
+    const service = safeConfiguredName(values.service, app.systemd?.service, "Servicio systemd");
+    await command("systemctl", ["restart", service]);
+    await command("systemctl", ["is-active", service]);
+    return;
+  }
+  if (action === "systemd-status") {
+    const service = safeConfiguredName(values.service, app.systemd?.service, "Servicio systemd");
+    await command("systemctl", ["is-active", service]);
+    return;
+  }
+  if (action === "systemd-logs") {
+    const service = safeConfiguredName(values.service, app.systemd?.service, "Servicio systemd");
+    const { lines, follow } = linesAndFollow(values);
+    await command("journalctl", ["-u", service, "-n", lines, "--no-pager", ...(follow ? ["-f"] : [])]);
+    return;
+  }
+  if (action === "docker-build") {
+    const dockerfile = safeRelativeFile(projectPath, values.dockerfile || app.docker?.dockerfile || "Dockerfile", "Dockerfile");
+    const image = safeConfiguredName(values.image, app.docker?.image, "Imagen Docker");
+    const commit = values.commit;
+    if (!SAFE_COMMIT.test(commit || "")) fail("Commit Docker no válido");
+    await command("docker", [
+      "build", "--file", dockerfile,
+      "--label", `tech.juancarloscruz.juanos.commit=${commit}`,
+      "--label", `tech.juancarloscruz.juanos.deployment=${values.deployment}`,
+      "--tag", `${image}:${commit}`, "--tag", `${image}:latest`, "."
+    ], { cwd: projectPath });
+    return;
+  }
+  if (action === "docker-recreate") {
+    const image = safeConfiguredName(values.image, app.docker?.image, "Imagen Docker");
+    const container = safeConfiguredName(values.container, app.docker?.container, "Contenedor Docker");
+    const commit = values.commit;
+    if (!SAFE_COMMIT.test(commit || "")) fail("Commit Docker no válido");
+    await command("docker", ["rm", "--force", container]).catch(() => {});
+    const args = [
+      "run", "-d", "--restart", "unless-stopped", "--name", container,
+      "--label", `tech.juancarloscruz.juanos.commit=${commit}`,
+      "--label", `tech.juancarloscruz.juanos.deployment=${values.deployment}`
+    ];
+    if (app.docker?.envFile) args.push("--env-file", safeRelativeFile(projectPath, app.docker.envFile, "envFile"));
+    for (const mapping of app.docker?.ports || []) args.push("-p", String(mapping));
+    for (const volume of app.docker?.volumes || []) args.push("-v", String(volume));
+    args.push(`${image}:${commit}`);
+    await command("docker", args, { cwd: projectPath });
+    return;
+  }
+  if (action === "docker-status") {
+    const container = safeConfiguredName(values.container, app.docker?.container, "Contenedor Docker");
+    await command("docker", ["inspect", "--format", "{{.State.Status}}", container]);
+    return;
+  }
+  if (action.startsWith("compose-")) {
+    const composeFile = composeTarget(app, values);
+    const base = ["compose", "--file", composeFile];
+    if (action === "compose-pull") await command("docker", [...base, "pull"], { cwd: projectPath });
+    if (action === "compose-build") await command("docker", [...base, "build"], { cwd: projectPath });
+    if (action === "compose-up") await command("docker", [...base, "up", "-d", "--remove-orphans"], { cwd: projectPath });
+    if (action === "compose-restart") {
+      const service = safeConfiguredName(values["compose-service"], app.compose?.service, "Servicio Compose");
+      await command("docker", [...base, "restart", service], { cwd: projectPath });
+    }
+    if (action === "compose-status") {
+      const args = [...base, "ps", "--format", "json"];
+      if (values["compose-service"]) {
+        const allowed = app.compose?.services || [];
+        if (!allowed.includes(values["compose-service"])) fail("Servicio Compose no autorizado");
+        args.push(values["compose-service"]);
+      }
+      await command("docker", args, { cwd: projectPath });
+    }
+    if (action === "compose-logs") {
+      const { lines, follow } = linesAndFollow(values);
+      const args = [...base, "logs", "--tail", lines, "--no-color", ...(follow ? ["--follow"] : [])];
+      if (values["compose-service"]) {
+        const allowed = app.compose?.services || [];
+        if (!allowed.includes(values["compose-service"])) fail("Servicio Compose no autorizado");
+        args.push(values["compose-service"]);
+      }
+      await command("docker", args, { cwd: projectPath });
+    }
+    return;
+  }
+  if (action === "nginx-logs") {
+    const { lines, follow } = linesAndFollow(values);
+    const source = values.source;
+    if (!["access", "error"].includes(source)) fail("Fuente Nginx no válida");
+    const logPath = app.nginx?.[`${source}Log`];
+    if (!path.isAbsolute(logPath || "")) fail("Log Nginx no configurado");
+    const real = fs.realpathSync(logPath);
+    const expectedPrefix = `/var/log/nginx/${app.nginx.siteName || ""}`;
+    if (!real.startsWith(expectedPrefix)) fail("Log Nginx fuera del prefijo autorizado");
+    await command("tail", ["-n", lines, ...(follow ? ["-f"] : []), real]);
+    return;
+  }
+  if (action === "nginx-configure") {
+    const target = writeNginxConfig(app);
+    process.stdout.write(`Vhost generado: ${target}\n`);
+    return;
+  }
+  if (action === "nginx-test-reload") {
+    if (!app.nginx?.siteName) fail("Nginx no configurado para la aplicación");
+    await command("nginx", ["-t"]);
+    await command("systemctl", ["reload", "nginx"]);
+    return;
+  }
+  if (action === "certbot-issue") {
+    const domain = configuredDomain(app, values.domain);
+    const args = ["--nginx", "--non-interactive", "--agree-tos", "-d", domain];
+    if (values["include-www"] === "true") {
+      const www = `www.${domain}`;
+      configuredDomain(app, www);
+      args.push("-d", www);
+    }
+    await command("certbot", ["certonly", ...args]);
+    writeNginxConfig(app);
+    await command("nginx", ["-t"]);
+    await command("systemctl", ["reload", "nginx"]);
+    return;
+  }
+  if (action === "certbot-dry-run") {
+    configuredDomain(app, values.domain);
+    await command("certbot", ["renew", "--dry-run", "--cert-name", values.domain, "--non-interactive"]);
+    return;
+  }
+  if (action === "certbot-certificates") {
+    await command("certbot", ["certificates"]);
+    return;
+  }
+  if (action === "publish-static") {
+    const source = safeRelativeFile(projectPath, values.source, "Artefacto estático");
+    const sourceStat = fs.statSync(source);
+    if (!sourceStat.isDirectory()) fail("El artefacto estático no es un directorio");
+    if (!SAFE_COMMIT.test(values.commit || "")) fail("Commit de release no válido");
+    const releaseRoot = realDirectory(app.static?.releaseRoot, "releaseRoot");
+    const release = path.join(releaseRoot, values.commit);
+    fs.mkdirSync(release, { recursive: true, mode: 0o755 });
+    await command("rsync", ["-a", "--delete", `${source}/`, `${release}/`]);
+    const next = path.join(releaseRoot, ".current-next");
+    const current = app.static?.currentSymlink;
+    if (!path.isAbsolute(current || "") || !current.startsWith(`${path.dirname(releaseRoot)}${path.sep}`)) {
+      fail("Symlink current no autorizado");
+    }
+    fs.rmSync(next, { force: true });
+    fs.symlinkSync(release, next);
+    fs.renameSync(next, current);
+    return;
+  }
+  if (action === "rollback-release") {
+    const releaseRoot = realDirectory(app.static?.releaseRoot, "releaseRoot");
+    const releases = fs.readdirSync(releaseRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && SAFE_COMMIT.test(entry.name))
+      .map((entry) => ({ name: entry.name, time: fs.statSync(path.join(releaseRoot, entry.name)).mtimeMs }))
+      .sort((a, b) => b.time - a.time);
+    if (releases.length < 2) fail("No existe una release anterior disponible");
+    const previous = path.join(releaseRoot, releases[1].name);
+    const current = app.static?.currentSymlink;
+    const next = path.join(releaseRoot, ".current-next");
+    fs.rmSync(next, { force: true });
+    fs.symlinkSync(previous, next);
+    fs.renameSync(next, current);
+    process.stdout.write(`Release activada: ${releases[1].name}\n`);
+    return;
+  }
+  if (action === "database-backup") {
+    const backup = app.databaseBackup;
+    if (!backup || values.strategy !== backup.strategy) fail("Backup no autorizado por la política");
+    const backupRoot = realDirectory(backup.outputDirectory, "Directorio de backups");
+    const target = path.join(backupRoot, `${values.deployment}.dump`);
+    if (backup.strategy === "pg_dump_local") {
+      const args = ["--format=custom", "--file", target];
+      if (backup.host) args.push("--host", backup.host);
+      if (backup.port) args.push("--port", String(backup.port));
+      if (backup.user) args.push("--username", backup.user);
+      args.push(backup.database);
+      await command("pg_dump", args, { env: backup.pgpassFile ? { PGPASSFILE: backup.pgpassFile } : {} });
+    } else if (backup.strategy === "docker_exec_pg_dump") {
+      const container = safeConfiguredName(null, backup.container, "Contenedor PostgreSQL");
+      await command("docker", ["exec", container, "pg_dump", "--format=custom", "--file", `/tmp/${values.deployment}.dump`, backup.database]);
+      await command("docker", ["cp", `${container}:/tmp/${values.deployment}.dump`, target]);
+      await command("docker", ["exec", container, "rm", "-f", `/tmp/${values.deployment}.dump`]);
+    } else if (backup.strategy === "custom_script") {
+      const script = fs.realpathSync(backup.script);
+      const stat = fs.statSync(script);
+      if (stat.uid !== 0 || (stat.mode & 0o022) !== 0 || (stat.mode & 0o111) === 0) {
+        fail("Script de backup inseguro");
+      }
+      await command(script, ["--output", target, "--deployment", values.deployment]);
+    } else fail("Estrategia de backup no soportada");
+    const stat = fs.statSync(target);
+    if (!stat.isFile() || stat.size === 0) fail("Backup vacío o inexistente");
+    const checksumResult = await command("sha256sum", [target], { capture: true });
+    const digest = checksumResult.stdout.trim().split(/\s+/)[0];
+    process.stdout.write(`${JSON.stringify({ path: target, checksum: digest, size: stat.size })}\n`);
+    return;
+  }
+  fail(`Acción host no soportada: ${action}`);
+}
+
+const { action, values } = parseArguments(process.argv.slice(2));
+if (process.getuid?.() !== 0) fail("El helper privilegiado debe ejecutarse como root");
+if (!SAFE_SLUG.test(values.application || "")) fail("Slug de aplicación no válido");
+const policy = readPolicy();
+const application = policy.applications[values.application];
+if (!application) fail("Aplicación no autorizada por la política");
+
+runAction(action, values, application).catch((error) => fail(error.message, 1));

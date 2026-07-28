@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-label="JC monogram">
+  <title>JC monogram</title>
+  <rect width="256" height="256" rx="40" fill="#0C1016"/>
+  <text x="128" y="152" text-anchor="middle" font-family="Geist, Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="110" font-weight="500" letter-spacing="-6" fill="#F8F4EE">JC</text>
+  <path d="M 62 184 C 106 176, 150 176, 194 184" fill="none" stroke="#D4A06A" stroke-width="6" stroke-linecap="round"/>
+</svg>

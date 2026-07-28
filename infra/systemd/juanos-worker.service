@@ -1,0 +1,26 @@
+[Unit]
+Description=JuanOS deployment worker
+After=network-online.target docker.service postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=webterminal
+Group=webterminal
+WorkingDirectory=/opt/juanos/current
+EnvironmentFile=/etc/juanos/worker.env
+ExecStart=/usr/bin/node apps/api/src/worker-server.js
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=90
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/srv/juanos/projects /var/lib/juanos /var/www /opt/juanos /etc/nginx /etc/letsencrypt /var/lib/letsencrypt /var/log/letsencrypt
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

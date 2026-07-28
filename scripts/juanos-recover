@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+unit="${JUANOS_SYSTEMD_UNIT:-juanos.service}"
+root="${JUANOS_INSTALL_ROOT:-/opt/juanos}"
+snapshots="${JUANOS_RECOVERY_ROOT:-/var/lib/juanos/recovery}"
+current="${root}/current"
+
+usage() {
+  echo "Uso: juanos-recover {status|logs|restart|version|snapshots|rollback RELEASE}"
+}
+
+require_root() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    echo "Esta acción requiere root desde una sesión SSH." >&2
+    exit 1
+  fi
+}
+
+case "${1:-}" in
+  status)
+    systemctl status "${unit}" --no-pager
+    ;;
+  logs)
+    journalctl -u "${unit}" -n "${JUANOS_LOG_LINES:-200}" --no-pager
+    ;;
+  restart)
+    require_root
+    systemctl restart "${unit}"
+    systemctl is-active "${unit}"
+    ;;
+  version)
+    if [[ -f "${current}/VERSION" ]]; then
+      sed -n '1p' "${current}/VERSION"
+    elif [[ -f "${current}/package.json" ]]; then
+      node -p "require('${current}/package.json').version"
+    else
+      echo "Versión no disponible" >&2
+      exit 1
+    fi
+    ;;
+  snapshots)
+    if [[ ! -d "${snapshots}" ]]; then
+      echo "No hay directorio de snapshots."
+      exit 0
+    fi
+    find "${snapshots}" -maxdepth 1 -type f -name '*.age' -print | sort
+    ;;
+  rollback)
+    require_root
+    release="${2:-}"
+    if [[ ! "${release}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+      echo "Identificador de release no válido." >&2
+      exit 1
+    fi
+    target="${root}/releases/${release}"
+    if [[ ! -d "${target}" || ! -f "${target}/package.json" ]]; then
+      echo "La release no existe o no parece JuanOS: ${target}" >&2
+      exit 1
+    fi
+    ln -sfn "${target}" "${root}/.current-next"
+    mv -Tf "${root}/.current-next" "${current}"
+    systemctl restart "${unit}"
+    systemctl is-active "${unit}"
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac

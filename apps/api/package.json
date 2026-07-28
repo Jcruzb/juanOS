@@ -1,0 +1,38 @@
+{
+  "name": "@juanos/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch --env-file=../../.env src/server.js",
+    "start": "node src/server.js",
+    "build": "node --check src/server.js && node --check src/app.js",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test",
+    "db:migrate": "node scripts/migrate.js",
+    "db:seed": "node scripts/seed.js"
+  },
+  "dependencies": {
+    "@juanos/config": "*",
+    "@juanos/shared": "*",
+    "argon2": "^0.44.0",
+    "cookie": "^1.0.2",
+    "cookie-parser": "^1.4.7",
+    "express": "^5.1.0",
+    "express-rate-limit": "^8.1.0",
+    "helmet": "^8.1.0",
+    "node-pty": "^1.1.0",
+    "pg": "^8.16.3",
+    "pino": "^9.13.0",
+    "pino-http": "^10.5.0",
+    "ws": "^8.18.3",
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "@types/cookie-parser": "^1.4.9",
+    "@types/express": "^5.0.4",
+    "@types/pg": "^8.15.5",
+    "supertest": "^7.1.4",
+    "typescript": "^5.9.3"
+  }
+}

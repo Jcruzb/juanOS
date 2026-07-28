@@ -1,0 +1,5 @@
+# Install as /etc/sudoers.d/juanos-host-helper with owner root:root and mode 0440.
+# The API/worker cannot run arbitrary sudo commands; only this root-owned policy helper.
+webterminal ALL=(root) NOPASSWD: /usr/local/libexec/juanos-host-action *
+webterminal ALL=(root) NOPASSWD: /usr/local/libexec/juanos-recovery *
+webterminal ALL=(root) NOPASSWD: /usr/local/libexec/juanos-self-update *

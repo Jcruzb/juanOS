@@ -1,0 +1,19 @@
+[Unit]
+Description=JuanOS API and web containers
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/juanos/current
+EnvironmentFile=/etc/juanos/compose.env
+ExecStart=/usr/bin/docker compose up -d --build postgres api web
+ExecReload=/usr/bin/docker compose up -d --build api web
+ExecStop=/usr/bin/docker compose stop api web
+TimeoutStartSec=600
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

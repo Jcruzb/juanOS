@@ -1,0 +1,8 @@
+{
+  "user": {
+    "email": "admin@juanos.local",
+    "password": "replace-with-at-least-16-characters",
+    "role": "admin",
+    "isActive": true
+  }
+}

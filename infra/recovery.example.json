@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "recoveryRoot": "/var/lib/juanos/recovery",
+  "juanosVersion": "0.1.0",
+  "includeEnvironmentSecrets": false,
+  "postgres": {
+    "database": "juanos",
+    "user": "juanos",
+    "host": "127.0.0.1",
+    "port": 5433,
+    "pgpassFile": "/etc/juanos/recovery.pgpass"
+  },
+  "age": {
+    "recipient": "age1replace-with-public-recipient",
+    "identityFile": "/etc/juanos/recovery-age-key.txt"
+  },
+  "rclone": {
+    "provider": "onedrive",
+    "remote": "juanos-recovery",
+    "basePath": "JuanOS/snapshots"
+  },
+  "includePaths": [
+    {
+      "source": "/etc/juanos/host-policy.json",
+      "destination": "config/host-policy.json"
+    },
+    {
+      "source": "/etc/nginx/sites-available/juanos",
+      "destination": "nginx/juanos"
+    },
+    {
+      "source": "/usr/local/bin/juanos-recover",
+      "destination": "bin/juanos-recover"
+    }
+  ]
+}

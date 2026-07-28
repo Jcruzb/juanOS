@@ -1,0 +1,111 @@
+#!/usr/bin/env node
+
+import fs from "node:fs";
+import path from "node:path";
+import { spawn } from "node:child_process";
+
+const CONFIG_PATH = "/etc/juanos/self-update.json";
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function fail(message, code = 2) {
+  process.stderr.write(`${message}\n`);
+  process.exit(code);
+}
+
+function rootOwned(filePath, label) {
+  const stat = fs.lstatSync(filePath);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.uid !== 0 || (stat.mode & 0o022) !== 0) {
+    fail(`${label} debe ser root-owned y no modificable`);
+  }
+  return fs.readFileSync(filePath, "utf8");
+}
+
+function config() {
+  const value = JSON.parse(rootOwned(process.env.JUANOS_SELF_UPDATE_CONFIG || CONFIG_PATH, "Configuración self-update"));
+  for (const key of ["projectRoot", "installRoot", "environmentFile", "apiUnit", "workerUnit"]) {
+    if (!value[key] || (key.endsWith("Root") || key.endsWith("File")) && !path.isAbsolute(value[key])) {
+      fail(`Configuración inválida: ${key}`);
+    }
+  }
+  return value;
+}
+
+function environmentFromFile(filePath) {
+  const environment = {};
+  for (const line of rootOwned(filePath, "EnvironmentFile").split(/\r?\n/)) {
+    if (!line || line.trimStart().startsWith("#")) continue;
+    const separator = line.indexOf("=");
+    if (separator < 1) continue;
+    const key = line.slice(0, separator).trim();
+    const value = line.slice(separator + 1).trim().replace(/^(['"])(.*)\1$/, "$2");
+    if (/^[A-Z_][A-Z0-9_]*$/.test(key)) environment[key] = value;
+  }
+  return environment;
+}
+
+function command(executable, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(executable, args, {
+      cwd: options.cwd,
+      env: {
+        PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        ...(options.env || {})
+      },
+      stdio: "inherit",
+      shell: false
+    });
+    child.on("error", reject);
+    child.on("close", (code) => code === 0 ? resolve() : reject(new Error(`${executable} terminó con código ${code}`)));
+  });
+}
+
+async function update(value, deploymentId) {
+  const projectRoot = fs.realpathSync(value.projectRoot);
+  const installRoot = fs.realpathSync(value.installRoot);
+  const releaseRoot = path.join(installRoot, "releases");
+  fs.mkdirSync(releaseRoot, { recursive: true, mode: 0o755 });
+  const commitResult = await new Promise((resolve, reject) => {
+    const child = spawn("git", ["rev-parse", "HEAD"], { cwd: projectRoot, shell: false });
+    let output = "";
+    child.stdout.on("data", (chunk) => { output += chunk; });
+    child.on("error", reject);
+    child.on("close", (code) => code === 0 ? resolve(output.trim()) : reject(new Error("No se pudo leer el commit")));
+  });
+  if (!/^[a-f0-9]{40}$/.test(commitResult)) fail("Commit JuanOS inválido");
+  const release = path.join(releaseRoot, commitResult);
+  fs.mkdirSync(release, { recursive: true, mode: 0o755 });
+  await command("rsync", [
+    "-a", "--delete", "--exclude", ".git", "--exclude", "node_modules",
+    "--exclude", ".env", `${projectRoot}/`, `${release}/`
+  ]);
+  const environment = environmentFromFile(value.environmentFile);
+  await command("npm", ["ci"], { cwd: release, env: environment });
+  await command("npm", ["run", "build"], { cwd: release, env: environment });
+  await command("npm", ["run", "db:migrate", "-w", "@juanos/api"], { cwd: release, env: environment });
+  await command("node", ["--check", "apps/api/src/server.js"], { cwd: release, env: environment });
+  fs.writeFileSync(path.join(release, "VERSION"), `${commitResult}\n`, { mode: 0o644 });
+  const current = path.join(installRoot, "current");
+  const next = path.join(installRoot, ".current-next");
+  fs.rmSync(next, { force: true });
+  fs.symlinkSync(release, next);
+  fs.renameSync(next, current);
+  const unitSuffix = deploymentId.slice(0, 8);
+  await command("systemd-run", [
+    "--unit", `juanos-api-restart-${unitSuffix}`, "--on-active=2s",
+    "systemctl", "restart", value.apiUnit
+  ]);
+  await command("systemd-run", [
+    "--unit", `juanos-worker-restart-${unitSuffix}`, "--on-active=60s",
+    "systemctl", "restart", value.workerUnit
+  ]);
+  process.stdout.write(`${JSON.stringify({ commit: commitResult, release, apiRestartScheduled: true })}\n`);
+}
+
+if (process.getuid?.() !== 0) fail("Self-update debe ejecutarse como root");
+const [action, ...args] = process.argv.slice(2);
+const deploymentIndex = args.indexOf("--deployment");
+const deploymentId = deploymentIndex >= 0 ? args[deploymentIndex + 1] : null;
+if (action !== "update" || !UUID.test(deploymentId || "")) {
+  fail("Uso: juanos-self-update update --deployment UUID");
+}
+update(config(), deploymentId).catch((error) => fail(error.message, 1));

@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "applications": {
+    "example-app": {
+      "projectPath": "/srv/juanos/projects/example-app",
+      "domains": ["example.juancarloscruz.tech"],
+      "systemd": {
+        "service": "example-app.service"
+      },
+      "compose": {
+        "file": "compose.yml",
+        "services": ["web", "api", "worker"],
+        "service": "api"
+      },
+      "docker": {
+        "dockerfile": "Dockerfile",
+        "image": "example-app",
+        "container": "example-app",
+        "envFile": ".env",
+        "ports": ["127.0.0.1:4100:4000"],
+        "volumes": []
+      },
+      "nginx": {
+        "siteName": "example-app",
+        "domain": "example.juancarloscruz.tech",
+        "kind": "proxy",
+        "webPort": 4100,
+        "securityHeaders": true,
+        "accessLog": "/var/log/nginx/example-app.access.log",
+        "errorLog": "/var/log/nginx/example-app.error.log"
+      },
+      "static": {
+        "releaseRoot": "/var/www/example-app/releases",
+        "currentSymlink": "/var/www/example-app/current"
+      },
+      "databaseBackup": {
+        "strategy": "pg_dump_local",
+        "database": "example",
+        "user": "example",
+        "host": "127.0.0.1",
+        "port": 5432,
+        "pgpassFile": "/etc/juanos/pgpass-example",
+        "outputDirectory": "/var/lib/juanos/backups/example-app"
+      }
+    }
+  }
+}

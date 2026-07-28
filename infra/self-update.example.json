@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "projectRoot": "/srv/juanos/projects/juanos",
+  "installRoot": "/opt/juanos",
+  "environmentFile": "/etc/juanos/worker.env",
+  "apiUnit": "juanos-api.service",
+  "workerUnit": "juanos-worker.service"
+}

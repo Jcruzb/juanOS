@@ -1,0 +1,90 @@
+name: juanos
+
+services:
+  postgres:
+    image: postgres:17.6-alpine
+    environment:
+      POSTGRES_DB: juanos
+      POSTGRES_USER: juanos
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Define POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5433}:5432"
+    networks: [private]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U juanos -d juanos"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    entrypoint: ["/app/infra/docker/api-entrypoint.sh"]
+    environment:
+      NODE_ENV: production
+      PORT: 4000
+      APP_ORIGIN: https://${JUANOS_DOMAIN:?Define JUANOS_DOMAIN}
+      DATABASE_URL: postgresql://juanos:${POSTGRES_PASSWORD}@postgres:5432/juanos
+      SESSION_SECRET: ${SESSION_SECRET:?Define SESSION_SECRET}
+      SESSION_IDLE_MINUTES: ${SESSION_IDLE_MINUTES:-30}
+      PROJECTS_ROOT: ${PROJECTS_CONTAINER_PATH:-/srv/juanos/projects}
+      DEPLOY_LOGS_DIR: ${DEPLOY_LOGS_HOST_PATH:-/var/lib/juanos/deployments}
+      EMBEDDED_WORKER: ${EMBEDDED_WORKER:-0}
+      TRUST_PROXY: "1"
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      JUANOS_PROJECT_PATH: ${JUANOS_PROJECT_PATH:-}
+      JUANOS_REPOSITORY_URL: ${JUANOS_REPOSITORY_URL:-}
+      JUANOS_DEFAULT_BRANCH: ${JUANOS_DEFAULT_BRANCH:-main}
+    volumes:
+      - type: bind
+        source: ${PROJECTS_HOST_PATH:?Define PROJECTS_HOST_PATH}
+        target: ${PROJECTS_CONTAINER_PATH:-/srv/juanos/projects}
+      - terminal_home:/home/webterminal
+      - type: bind
+        source: ${DEPLOY_LOGS_HOST_PATH:-/var/lib/juanos/deployments}
+        target: ${DEPLOY_LOGS_HOST_PATH:-/var/lib/juanos/deployments}
+    ports:
+      - "127.0.0.1:${API_HOST_PORT:-4000}:4000"
+    networks: [private, egress]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/api/health').then(r=>{if(!r.ok)process.exit(1)})"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    networks: [private]
+    ports:
+      - "127.0.0.1:${WEB_HOST_PORT:-5173}:80"
+    entrypoint: ["nginx", "-g", "daemon off;"]
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    cap_add: ["CHOWN", "SETGID", "SETUID"]
+    restart: unless-stopped
+
+networks:
+  private:
+    internal: true
+  egress:
+
+volumes:
+  postgres_data:
+  terminal_home:
