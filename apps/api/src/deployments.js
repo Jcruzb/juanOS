@@ -178,6 +178,10 @@ export function createDeploymentsRouter({ express, db }) {
       const result = await db.query(
         `UPDATE deployments SET status = 'queued', confirmed_at = now()
          WHERE id = $1 AND plan_hash = $2 AND status = 'waiting_confirmation'
+          AND EXISTS (
+            SELECT 1 FROM projects p
+            WHERE p.id = deployments.project_id AND p.is_active = true
+          )
          RETURNING project_id`,
         [deploymentId, input.planHash]
       );

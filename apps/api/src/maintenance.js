@@ -42,6 +42,11 @@ export async function inspectCertificates(db, config) {
     }
   });
   const certificates = parseCertbotCertificates(stdout);
+  await db.query(
+    `INSERT INTO system_observations (kind, status, value)
+     VALUES ('certificates','ok',$1::jsonb)`,
+    [JSON.stringify({ certificates })]
+  );
   for (const certificate of certificates) {
     for (const domain of certificate.domains) {
       await db.query(

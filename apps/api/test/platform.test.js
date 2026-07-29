@@ -23,6 +23,7 @@ import {
   parseLegacyGlobalIndex
 } from "../src/discovery.js";
 import { certificateSeverity, parseCertbotCertificates, parseCertbotDryRun } from "../src/certificates.js";
+import { mergeCertificateInventory } from "../src/operations.js";
 import { buildRecoveryManifest, validateRecoveryManifest } from "../src/recovery.js";
 import { readPersistedOutput } from "../src/deployment-ws.js";
 import { recoverInterruptedDeployments } from "../src/deployment-worker.js";
@@ -33,6 +34,7 @@ import {
 } from "../src/operational-logs.js";
 import { projectSchema } from "@juanos/shared";
 import { runHostAction } from "../src/host-operations.js";
+import { archiveProjectRegistration } from "../src/projects.js";
 
 test("parsea .env sin romper comentarios, orden, comillas ni valores con igual", () => {
   const content = "# cabecera\r\nDATABASE_URL=\"postgres://user:pass@db/app?x=a=b\"\r\nDEBUG = False\r\n\r\n";
@@ -154,6 +156,76 @@ test("calcula expiración SSL y resultado de Certbot dry-run", () => {
   assert.equal(certificateSeverity(3), "critical");
   assert.equal(parseCertbotDryRun("Congratulations, all simulated renewals succeeded.", 0).success, true);
   assert.equal(parseCertbotDryRun("renewal failed", 1).success, false);
+});
+
+test("conserva certificados de Certbot aunque el dominio aún no esté asociado", () => {
+  const certificates = mergeCertificateInventory([], {
+    certificates: [{
+      domains: ["unassigned.example.com"],
+      issuer: "Let's Encrypt",
+      expiresAt: "2026-08-07T12:00:00.000Z"
+    }]
+  }, new Date("2026-07-28T12:00:00.000Z"));
+  assert.equal(certificates.length, 1);
+  assert.equal(certificates[0].domain, "unassigned.example.com");
+  assert.equal(certificates[0].applicationId, null);
+  assert.equal(certificates[0].daysRemaining, 10);
+});
+
+test("combina inventario Certbot con la aplicación registrada", () => {
+  const certificates = mergeCertificateInventory([{
+    id: "certificate-id",
+    applicationId: "application-id",
+    applicationName: "JuanOS",
+    domain: "juanos.example.com",
+    expiresAt: null,
+    autoRenewConfigured: false
+  }], {
+    certificates: [{
+      domains: ["juanos.example.com"],
+      issuer: "Let's Encrypt",
+      expiresAt: "2026-08-27T12:00:00.000Z"
+    }]
+  }, new Date("2026-07-28T12:00:00.000Z"));
+  assert.equal(certificates[0].applicationId, "application-id");
+  assert.equal(certificates[0].expiresAt, "2026-08-27T12:00:00.000Z");
+  assert.equal(certificates[0].daysRemaining, 30);
+});
+
+test("quitar una aplicación conserva sus datos y bloquea JuanOS u operaciones activas", async () => {
+  const makeDb = (project, active = false) => {
+    const statements = [];
+    return {
+      statements,
+      transaction: async (callback) => callback({
+        query: async (sql) => {
+          statements.push(sql);
+          if (sql.includes("FROM projects")) return { rows: [project] };
+          if (sql.includes("SELECT EXISTS")) return { rows: [{ active }] };
+          return { rows: [], rowCount: 1 };
+        }
+      })
+    };
+  };
+  const regular = makeDb({ id: "application-id", name: "Example", isJuanOS: false });
+  await archiveProjectRegistration(regular, "application-id");
+  assert.ok(regular.statements.some((sql) => sql.includes("SET is_active = false")));
+  assert.ok(regular.statements.every((sql) => !sql.includes("DELETE FROM projects")));
+
+  await assert.rejects(
+    archiveProjectRegistration(
+      makeDb({ id: "juanos-id", name: "JuanOS", isJuanOS: true }),
+      "juanos-id"
+    ),
+    (error) => error.code === "SELF_REMOVAL_FORBIDDEN"
+  );
+  await assert.rejects(
+    archiveProjectRegistration(
+      makeDb({ id: "busy-id", name: "Busy", isJuanOS: false }, true),
+      "busy-id"
+    ),
+    (error) => error.code === "APPLICATION_BUSY"
+  );
 });
 
 test("verifica integridad de un recovery y detecta corrupción", async (context) => {

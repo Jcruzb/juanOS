@@ -42,12 +42,12 @@ async function enrichProject(project) {
     const [status, branch, commit, fullCommit, pending] = await Promise.all([
       runGit(project.localPath, ["status", "--porcelain=v1"]),
       runGit(project.localPath, ["branch", "--show-current"]),
-      runGit(project.localPath, ["log", "-1", "--pretty=format:%h%x09%s"]),
+      runGit(project.localPath, ["log", "-1", "--pretty=format:%h%x09%cI%x09%s"]),
       runGit(project.localPath, ["rev-parse", "HEAD"]),
       runGit(project.localPath, ["rev-list", "--count", `HEAD..origin/${project.defaultBranch}`])
         .catch(() => ({ stdout: "" }))
     ]);
-    const [shortSha = "", message = "Sin commits"] = commit.stdout.split("\t");
+    const [shortSha = "", committedAt = "", message = "Sin commits"] = commit.stdout.split("\t");
     const currentBranch = branch.stdout.trim() || project.defaultBranch;
     const sslDaysRemaining = project.sslExpiresAt
       ? Math.ceil((new Date(project.sslExpiresAt).getTime() - Date.now()) / 86_400_000)
@@ -59,6 +59,7 @@ async function enrichProject(project) {
       repositoryStatus: status.stdout.trim() ? "modified" : "clean",
       changedFiles: status.stdout.split("\n").filter(Boolean).length,
       commit: shortSha,
+      committedAt: committedAt || null,
       message,
       pendingCommits: Number.parseInt(pending.stdout.trim(), 10) || 0,
       sslDaysRemaining,
@@ -85,6 +86,7 @@ async function enrichProject(project) {
       repositoryStatus: "unavailable",
       changedFiles: 0,
       commit: "",
+      committedAt: null,
       message: "Repositorio aún no disponible",
       pendingCommits: null,
       sslDaysRemaining: null,
@@ -104,6 +106,52 @@ function providerFor(repositoryUrl) {
   return "other";
 }
 
+export async function archiveProjectRegistration(db, applicationId) {
+  return db.transaction(async (transaction) => {
+    const project = await transaction.query(
+      `SELECT id, name, is_juanos AS "isJuanOS" FROM projects
+       WHERE id = $1 AND is_active = true FOR UPDATE`,
+      [applicationId]
+    );
+    if (!project.rows[0]) {
+      throw Object.assign(new Error("Aplicación no encontrada"), { status: 404 });
+    }
+    if (project.rows[0].isJuanOS) {
+      throw Object.assign(new Error("JuanOS no se puede quitar desde su propio catálogo"), {
+        status: 409,
+        code: "SELF_REMOVAL_FORBIDDEN"
+      });
+    }
+    const active = await transaction.query(
+      `SELECT EXISTS (
+         SELECT 1 FROM deployments
+         WHERE project_id = $1
+          AND status IN ('queued', 'running')
+       ) OR EXISTS (
+         SELECT 1 FROM operational_log_sessions
+         WHERE application_id = $1 AND status IN ('queued', 'running')
+       ) AS active`,
+      [applicationId]
+    );
+    if (active.rows[0]?.active) {
+      throw Object.assign(new Error("Cierra las operaciones activas antes de quitar la aplicación"), {
+        status: 409,
+        code: "APPLICATION_BUSY"
+      });
+    }
+    await transaction.query(
+      `UPDATE deployments SET status = 'cancelled', finished_at = now()
+       WHERE project_id = $1 AND status = 'waiting_confirmation'`,
+      [applicationId]
+    );
+    await transaction.query(
+      `UPDATE projects SET is_active = false, updated_at = now() WHERE id = $1`,
+      [applicationId]
+    );
+    return project.rows[0];
+  });
+}
+
 export function createProjectsRouter({ express, db, config }) {
   const router = express.Router();
 
@@ -119,7 +167,7 @@ export function createProjectsRouter({ express, db, config }) {
   router.get("/:projectId", async (request, response, next) => {
     try {
       const applicationId = idSchema.parse(request.params.projectId);
-      const result = await db.query(`${selectProject} WHERE p.id = $1`, [applicationId]);
+      const result = await db.query(`${selectProject} WHERE p.id = $1 AND p.is_active = true`, [applicationId]);
       if (!result.rows[0]) throw Object.assign(new Error("Aplicación no encontrada"), { status: 404 });
       const [application, services, deployments, alerts] = await Promise.all([
         enrichProject(result.rows[0]),
@@ -194,6 +242,20 @@ export function createProjectsRouter({ express, db, config }) {
         metadata: { minutes: input.minutes }
       });
       response.json({ ignoreUntil: result.rows[0].state_ignore_until });
+    } catch (error) { next(error); }
+  });
+
+  router.delete("/:projectId", requireCsrf, async (request, response, next) => {
+    try {
+      const applicationId = idSchema.parse(request.params.projectId);
+      const archived = await archiveProjectRegistration(db, applicationId);
+      await writeAudit(db, request, {
+        action: "application.archived",
+        resourceType: "application",
+        resourceId: applicationId,
+        metadata: { name: archived.name, filesRemoved: false, servicesChanged: false }
+      });
+      response.json({ id: applicationId, status: "archived" });
     } catch (error) { next(error); }
   });
 

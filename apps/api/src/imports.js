@@ -106,6 +106,7 @@ export function createImportsRouter({ express, db, config }) {
       }
       const applicationType = input.applicationType || inspection.applicationType;
       const name = input.name || inspection.name;
+      const domain = inspection.legacy?.domain || inspection.legacy?.domains?.[0] || null;
       const sourceFingerprint = crypto
         .createHash("sha256")
         .update(JSON.stringify(inspection.legacy || inspection.evidence))
@@ -171,6 +172,13 @@ export function createImportsRouter({ express, db, config }) {
             JSON.stringify({ environmentId: environment.rows[0].id })
           ]
         );
+        if (domain) {
+          await transaction.query(
+            `INSERT INTO application_domains (application_id, hostname, is_primary)
+             VALUES ($1,$2,true)`,
+            [applicationId, domain]
+          );
+        }
         await transaction.query(
           `INSERT INTO import_records
             (application_id, source_type, source_path, source_fingerprint, confidence, evidence, imported_at)

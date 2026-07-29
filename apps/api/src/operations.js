@@ -2,6 +2,44 @@ import { idSchema } from "@juanos/shared";
 import { requireCsrf } from "./auth.js";
 import { writeAudit } from "./audit.js";
 
+export function mergeCertificateInventory(registered, observation, now = new Date()) {
+  const byDomain = new Map(registered.map((certificate) => [
+    certificate.domain.toLowerCase(),
+    certificate
+  ]));
+  const observed = observation?.certificates || [];
+  for (const certificate of observed) {
+    for (const domain of certificate.domains || []) {
+      const key = domain.toLowerCase();
+      const current = byDomain.get(key);
+      const expiresAt = certificate.expiresAt || current?.expiresAt || null;
+      const daysRemaining = expiresAt
+        ? Math.floor((new Date(expiresAt).getTime() - now.getTime()) / 86_400_000)
+        : null;
+      byDomain.set(key, {
+        id: current?.id || `observed:${key}`,
+        applicationId: current?.applicationId || null,
+        applicationName: current?.applicationName || null,
+        domain,
+        issuer: certificate.issuer || current?.issuer || null,
+        issuedAt: current?.issuedAt || null,
+        expiresAt,
+        daysRemaining: Number.isFinite(daysRemaining) ? daysRemaining : null,
+        autoRenewConfigured: current?.autoRenewConfigured ?? true,
+        lastRenewalCheck: current?.lastRenewalCheck || null,
+        lastRenewalResult: current?.lastRenewalResult || null,
+        error: current?.error || null,
+        observedAt: current?.observedAt || now.toISOString()
+      });
+    }
+  }
+  return [...byDomain.values()].sort((left, right) => {
+    if (!left.expiresAt) return -1;
+    if (!right.expiresAt) return 1;
+    return new Date(left.expiresAt).getTime() - new Date(right.expiresAt).getTime();
+  });
+}
+
 export function createOperationsRouter({ express, db }) {
   const router = express.Router();
   router.get("/overview", async (_request, response, next) => {
@@ -80,7 +118,8 @@ export function createOperationsRouter({ express, db }) {
 
   router.get("/certificates", async (_request, response, next) => {
     try {
-      const result = await db.query(
+      const [result, inventory] = await Promise.all([
+        db.query(
         `SELECT c.id, c.application_id AS "applicationId", p.name AS "applicationName",
          c.domain, c.issuer, c.issued_at AS "issuedAt", c.expires_at AS "expiresAt",
          CASE WHEN c.expires_at IS NULL THEN NULL
@@ -90,9 +129,17 @@ export function createOperationsRouter({ express, db }) {
          c.last_renewal_result AS "lastRenewalResult", c.error,
          c.observed_at AS "observedAt"
          FROM certificates c JOIN projects p ON p.id = c.application_id
+         WHERE p.is_active = true
          ORDER BY c.expires_at NULLS FIRST, c.domain`
-      );
-      response.json({ certificates: result.rows });
+        ),
+        db.query(
+          `SELECT value FROM system_observations
+           WHERE kind = 'certificates' ORDER BY observed_at DESC LIMIT 1`
+        )
+      ]);
+      response.json({
+        certificates: mergeCertificateInventory(result.rows, inventory.rows[0]?.value)
+      });
     } catch (error) { next(error); }
   });
 

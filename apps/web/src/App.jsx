@@ -4,7 +4,7 @@ import { useLocation, useNavigate } from "react-router-dom";
 import {
   Activity, ArrowUpRight, Braces, ChevronRight, CircleDot, Clock3,
   Code2, FileCode2, FilePlus2, FolderGit2, FolderPlus, GitBranch, GitCommitHorizontal,
-  Import, LogOut, MoreHorizontal, Pencil, Plus, RefreshCw, Rocket, Search, Server,
+  Import, LogOut, Pencil, Plus, RefreshCw, Rocket, Search, Server,
   Settings, ShieldCheck, TerminalSquare, Trash2, UploadCloud, Wifi, AlertTriangle, Eye, EyeOff,
   Bell, LockKeyhole, HardDrive, Pause, Play, Copy, ArrowLeft, X, Layers3
 } from "lucide-react";
@@ -18,15 +18,39 @@ import "@xterm/xterm/css/xterm.css";
 
 const MonacoEditor = lazy(() => import("@monaco-editor/react"));
 
-function Brand({ compact = false }) {
+function relativeTime(value) {
+  if (!value) return "sin fecha";
+  const timestamp = new Date(value).getTime();
+  if (!Number.isFinite(timestamp)) return "sin fecha";
+  const seconds = Math.round((timestamp - Date.now()) / 1000);
+  /** @type {Array<[number, Intl.RelativeTimeFormatUnit]>} */
+  const ranges = [
+    [60, "second"], [60, "minute"], [24, "hour"], [30, "day"], [12, "month"]
+  ];
+  let amount = seconds;
+  /** @type {Intl.RelativeTimeFormatUnit} */
+  let unit = "second";
+  for (const [limit, nextUnit] of ranges) {
+    unit = nextUnit;
+    if (Math.abs(amount) < limit) break;
+    amount = Math.round(amount / limit);
+  }
+  if (unit === "month" && Math.abs(amount) >= 12) {
+    amount = Math.round(amount / 12);
+    unit = "year";
+  }
+  return new Intl.RelativeTimeFormat("es", { numeric: "auto" }).format(amount, unit);
+}
+
+function Brand({ compact = false, productOnly = false }) {
   return (
-    <div className={`brand ${compact ? "brand-compact" : ""}`}>
-      <img
-        className={compact ? "brand-app-mark" : "brand-signature"}
-        src={compact ? "/brand/jc-mark.svg" : "/brand/juan-cruz-logo-dark.svg"}
-        alt={compact ? "" : "Juan Cruz — Consultor senior tecnólogo"}
-        aria-hidden={compact || undefined}
-      />
+    <div className={`brand ${compact ? "brand-compact" : ""} ${productOnly ? "product-brand-only" : ""}`}>
+      {!productOnly && <img
+          className={compact ? "brand-app-mark" : "brand-signature"}
+          src={compact ? "/brand/jc-mark.svg" : "/brand/juan-cruz-logo-dark.svg"}
+          alt={compact ? "" : "Juan Cruz — Consultor senior tecnólogo"}
+          aria-hidden={compact || undefined}
+        />}
       <div className="product-lockup">
         <strong>JuanOS</strong>
         {!compact && <small>PRIVATE DEV WORKSPACE</small>}
@@ -76,27 +100,28 @@ const navItems = [
   ["Terminal", TerminalSquare], ["Ajustes", Settings]
 ];
 
-function Sidebar({ active, setActive, onLogout }) {
+function Sidebar({ active, setActive, onLogout, projectCount }) {
   return (
     <aside className="sidebar">
-      <Brand />
+      <Brand productOnly />
       <nav>
         <span className="nav-label">Workspace</span>
         {navItems.map(([label, Icon]) => (
           <button key={label} className={active === label ? "active" : ""} onClick={() => setActive(label)}>
-            <Icon size={19} /><span>{label}</span>{label === "Proyectos" && <b>2</b>}
+            <Icon size={19} /><span>{label}</span>{label === "Proyectos" && <b>{projectCount}</b>}
           </button>
         ))}
       </nav>
       <div className="sidebar-bottom">
-        <div className="server-health"><i /><div><strong>VPS conectado</strong><small>Madrid · 24ms</small></div><Wifi size={16} /></div>
+        <div className="server-health"><i /><div><strong>VPS conectado</strong><small>Estado observado por el worker</small></div><Wifi size={16} /></div>
+        <img className="sidebar-signature" src="/brand/juan-cruz-logo-dark.svg" alt="Juan Cruz — Consultor senior tecnólogo" />
         <button className="user-chip" onClick={onLogout}><span>JC</span><div><strong>Juan Cruz</strong><small>Administrador</small></div><LogOut size={16} /></button>
       </div>
     </aside>
   );
 }
 
-function ProjectCard({ project, onOpen, onDetail }) {
+function ProjectCard({ project, onOpen, onDetail, onRemove, removing }) {
   const clean = project.repositoryStatus === "clean";
   const repositoryAvailable = project.repositoryStatus !== "unavailable";
   const serviceLabel = project.service === "attention" ? "Revisar" : project.service === "online" ? "En línea" : project.service === "offline" ? "Offline" : "Sin comprobar";
@@ -106,7 +131,9 @@ function ProjectCard({ project, onOpen, onDetail }) {
       <header>
         <div className="project-icon"><Braces size={21} /></div>
         <div className="project-title"><h3>{project.name}</h3><span><i className={project.service === "online" ? "" : "off"} /> {serviceLabel}</span></div>
-        <button className="icon-button" aria-label="Más acciones"><MoreHorizontal size={21} /></button>
+        {project.isJuanOS
+          ? <span className="icon-button passive" title="JuanOS no se puede quitar"><ShieldCheck size={18} /></span>
+          : <button className="icon-button danger" disabled={removing} aria-label={`Quitar ${project.name} de JuanOS`} title="Quitar del catálogo" onClick={() => onRemove(project)}><Trash2 size={18} /></button>}
       </header>
       <div className="repo-line"><FolderGit2 size={14} /><span>{(project.repositoryUrl || "Repositorio no registrado").replace("https://", "")}</span></div>
       <div className="stats">
@@ -121,7 +148,7 @@ function ProjectCard({ project, onOpen, onDetail }) {
       <div className="commit">
         <div className="commit-mark"><Code2 size={15} /></div>
         <div><small>Último commit · {project.commit || "—"}</small><strong>{project.message || "Repositorio preparado"}</strong></div>
-        <span>hace 2h</span>
+        <span>{relativeTime(project.committedAt)}</span>
       </div>
       <div className="project-actions">
         <button onClick={() => onDetail(project.id, "terminal")}><TerminalSquare size={16} /> Terminal</button>
@@ -282,7 +309,8 @@ function TerminalView({ projects, initialProjectId = "" }) {
   const terminalRef = useRef(null);
   const socketRef = useRef(null);
   const sessionIdRef = useRef("");
-  const [projectId, setProjectId] = useState(initialProjectId || projects[0]?.id || "");
+  const [selectedProjectId, setSelectedProjectId] = useState("");
+  const projectId = selectedProjectId || initialProjectId || projects[0]?.id || "";
   const [status, setStatus] = useState("connecting");
   useEffect(() => {
     if (!containerRef.current || !projectId || projectId.startsWith("preview")) return undefined;
@@ -397,7 +425,7 @@ function TerminalView({ projects, initialProjectId = "" }) {
     <section className="terminal-screen">
       <div className="terminal-toolbar">
         <div><span className={`terminal-dot ${status}`} /><strong>Terminal</strong></div>
-        <select value={projectId} onChange={(event) => setProjectId(event.target.value)}>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select>
+        <select value={projectId} onChange={(event) => setSelectedProjectId(event.target.value)}>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select>
         <button onClick={() => send("\u0003")}>Ctrl+C</button>
         <button onClick={() => terminalRef.current?.clear()}>Limpiar</button>
       </div>
@@ -418,7 +446,8 @@ function flattenTree(nodes, depth = 0) {
 function FilesView({ projects, initialProjectId = "" }) {
   const queryClient = useQueryClient();
   const realProjects = projects.filter((project) => !project.id.startsWith("preview"));
-  const [projectId, setProjectId] = useState(initialProjectId || realProjects[0]?.id || "");
+  const [selectedProjectId, setSelectedProjectId] = useState("");
+  const projectId = selectedProjectId || initialProjectId || realProjects[0]?.id || "";
   const [selectedPath, setSelectedPath] = useState("");
   const [content, setContent] = useState("");
   const [hash, setHash] = useState("");
@@ -485,7 +514,7 @@ function FilesView({ projects, initialProjectId = "" }) {
   return (
     <section className="files-screen">
       <div className={`file-tree ${drawer ? "open" : ""}`}>
-        <div className="file-tree-head"><strong>Explorador</strong><select value={projectId} onChange={(e) => setProjectId(e.target.value)}>{realProjects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select><div className="file-actions"><button title="Nuevo archivo" onClick={() => createEntry("file")}><FilePlus2 size={14} /></button><button title="Nueva carpeta" onClick={() => createEntry("directory")}><FolderPlus size={14} /></button><button title="Renombrar" disabled={!selectedPath} onClick={renameEntry}><Pencil size={13} /></button><button title="Eliminar" disabled={!selectedPath} onClick={deleteEntry}><Trash2 size={13} /></button></div><form className="file-search" onSubmit={searchProject}><Search size={13} /><input value={searchText} onChange={(e) => setSearchText(e.target.value)} placeholder="Buscar texto…" /></form></div>
+        <div className="file-tree-head"><strong>Explorador</strong><select value={projectId} onChange={(e) => setSelectedProjectId(e.target.value)}>{realProjects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select><div className="file-actions"><button title="Nuevo archivo" onClick={() => createEntry("file")}><FilePlus2 size={14} /></button><button title="Nueva carpeta" onClick={() => createEntry("directory")}><FolderPlus size={14} /></button><button title="Renombrar" disabled={!selectedPath} onClick={renameEntry}><Pencil size={13} /></button><button title="Eliminar" disabled={!selectedPath} onClick={deleteEntry}><Trash2 size={13} /></button></div><form className="file-search" onSubmit={searchProject}><Search size={13} /><input value={searchText} onChange={(e) => setSearchText(e.target.value)} placeholder="Buscar texto…" /></form></div>
         {searchResults.length > 0 && <div className="search-results">{searchResults.map((match) => <button key={`${match.path}:${match.line}`} onClick={() => openFile(match.path)}><strong>{match.path}:{match.line}</strong><span>{match.preview}</span></button>)}</div>}
         <div className="tree-list">{flattenTree(treeQuery.data?.tree || []).map((node) => <button key={node.path} className={selectedPath === node.path ? "selected" : ""} style={{ paddingLeft: 12 + node.depth * 14 }} onClick={() => node.type === "file" ? openFile(node.path) : setSelectedPath(node.path)}>{node.type === "directory" ? "▾" : "·"} {node.name}</button>)}</div>
       </div>
@@ -520,13 +549,21 @@ function GitControls({ projectId, gitQuery, onRefresh }) {
   </div>;
 }
 
-function DeploymentsView({ projects, initialProjectId = "" }) {
+function DeploymentsView({ projects, initialProjectId = "", initialOperation = "update" }) {
   const queryClient = useQueryClient();
-  const [projectId, setProjectId] = useState(initialProjectId || projects[0]?.id || "");
-  const [operation, setOperation] = useState("update");
+  const [selectedProjectId, setSelectedProjectId] = useState("");
+  const projectId = selectedProjectId || initialProjectId || projects[0]?.id || "";
+  const validInitialOperation = ["deploy", "update", "repair", "restart", "ssl_test", "recovery", "recovery_test", "rollback"].includes(initialOperation)
+    ? initialOperation
+    : "update";
+  const [operation, setOperation] = useState(validInitialOperation);
   const [pendingPlan, setPendingPlan] = useState(null);
   const [liveLog, setLiveLog] = useState("");
-  const deployments = useQuery({ queryKey: ["deployments"], queryFn: () => api("/deployments") });
+  const deployments = useQuery({
+    queryKey: ["deployments", projectId],
+    queryFn: () => api(`/deployments?applicationId=${encodeURIComponent(projectId)}`),
+    enabled: Boolean(projectId)
+  });
   const connectToDeployment = (deploymentId) => {
       setLiveLog("Operación en cola; puedes cerrar esta pantalla sin detenerla.\n");
       const protocol = location.protocol === "https:" ? "wss:" : "ws:";
@@ -536,7 +573,7 @@ function DeploymentsView({ projects, initialProjectId = "" }) {
         if (message.type === "output") setLiveLog((value) => value + message.data);
         if (message.type === "end") {
           socket.close();
-          queryClient.invalidateQueries({ queryKey: ["deployments"] });
+          queryClient.invalidateQueries({ queryKey: ["deployments", projectId] });
         }
       };
   };
@@ -554,21 +591,28 @@ function DeploymentsView({ projects, initialProjectId = "" }) {
     }),
     onSuccess: ({ deploymentId }) => {
       setPendingPlan(null);
-      queryClient.invalidateQueries({ queryKey: ["deployments"] });
+      queryClient.invalidateQueries({ queryKey: ["deployments", projectId] });
       window.setTimeout(() => connectToDeployment(deploymentId), 350);
+    }
+  });
+  const cancelPlan = useMutation({
+    mutationFn: () => api(`/deployments/${pendingPlan.deploymentId}/cancel`, { method: "POST" }),
+    onSuccess: () => {
+      setPendingPlan(null);
+      queryClient.invalidateQueries({ queryKey: ["deployments", projectId] });
     }
   });
   return (
     <section className="deploy-screen">
-      <div className="deploy-head"><div><span className="eyebrow">Plan → confirmación → worker</span><h1>Despliegues</h1></div><div className="deploy-controls"><select value={projectId} onChange={(e) => setProjectId(e.target.value)}>{projects.map((project) => <option key={project.id} value={project.id}>{project.isJuanOS ? "JuanOS · ESTA APLICACIÓN" : project.name}</option>)}</select><select value={operation} onChange={(event) => setOperation(event.target.value)}><option value="update">Actualizar</option><option value="deploy">Desplegar</option><option value="restart">Reiniciar</option><option value="repair">Reparar</option><option value="rollback">Rollback release</option><option value="ssl_test">Probar SSL</option><option value="recovery">Crear recovery</option><option value="recovery_test">Probar recovery</option></select><button className="primary-button small" disabled={!projectId || createPlan.isPending} onClick={() => createPlan.mutate()}><Rocket size={16} /> Generar plan</button></div></div>
+      <div className="deploy-head"><div><span className="eyebrow">Plan → confirmación → worker</span><h1>Despliegues</h1></div><div className="deploy-controls"><select value={projectId} onChange={(e) => { setSelectedProjectId(e.target.value); setPendingPlan(null); setLiveLog(""); }}>{projects.map((project) => <option key={project.id} value={project.id}>{project.isJuanOS ? "JuanOS · ESTA APLICACIÓN" : project.name}</option>)}</select><select value={operation} onChange={(event) => setOperation(event.target.value)}><option value="update">Actualizar</option><option value="deploy">Desplegar</option><option value="restart">Reiniciar</option><option value="repair">Reparar</option><option value="rollback">Rollback release</option><option value="ssl_test">Probar SSL</option><option value="recovery">Crear recovery</option><option value="recovery_test">Probar recovery</option></select><button className="primary-button small" disabled={!projectId || createPlan.isPending} onClick={() => createPlan.mutate()}><Rocket size={16} /> Generar plan</button></div></div>
       {createPlan.error && <div className="form-error">{createPlan.error.message}</div>}
       {pendingPlan && <section className="plan-review">
         <header><div><span className="eyebrow">Plan inmutable</span><h2>Revisa antes de ejecutar</h2></div><code>{pendingPlan.planHash.slice(0, 12)}</code></header>
         {pendingPlan.plan.isJuanOS && <p className="self-warning"><ShieldCheck size={16} /> JuanOS creará recovery antes de preparar su actualización.</p>}
         {pendingPlan.plan.warnings.map((warning) => <p className="warning-box" key={warning.code}><AlertTriangle size={15} /> {warning.message}</p>)}
         <ol>{pendingPlan.plan.steps.map((step) => <li key={step.stepKey}><span>{pendingPlan.plan.steps.indexOf(step) + 1}</span><div><strong>{step.name}</strong><small>{step.action}{step.requiresSudo ? " · requiere privilegios limitados" : ""}</small></div></li>)}</ol>
-        {confirmPlan.error && <p className="form-error">{confirmPlan.error.message}</p>}
-        <div className="plan-actions"><button onClick={() => setPendingPlan(null)}>Cancelar</button><button className="primary-button small" disabled={confirmPlan.isPending} onClick={() => confirmPlan.mutate()}>{confirmPlan.isPending ? "Encolando…" : "Confirmar y ejecutar"}</button></div>
+        {(confirmPlan.error || cancelPlan.error) && <p className="form-error">{(confirmPlan.error || cancelPlan.error).message}</p>}
+        <div className="plan-actions"><button disabled={cancelPlan.isPending || confirmPlan.isPending} onClick={() => cancelPlan.mutate()}>{cancelPlan.isPending ? "Cancelando…" : "Cancelar"}</button><button className="primary-button small" disabled={confirmPlan.isPending || cancelPlan.isPending} onClick={() => confirmPlan.mutate()}>{confirmPlan.isPending ? "Encolando…" : "Confirmar y ejecutar"}</button></div>
       </section>}
       {liveLog && <pre className="live-log">{liveLog}</pre>}
       <div className="deployment-list">{(deployments.data?.deployments || []).map((item) => <article key={item.id}><span className={`deployment-status ${item.status}`} /><div><strong>{item.projectName}</strong><small>{item.operation} · {item.branch} · {(item.commitSha || "").slice(0, 8)}</small></div><b>{item.status}</b><time>{new Date(item.startedAt).toLocaleString()}</time></article>)}</div>
@@ -578,7 +622,8 @@ function DeploymentsView({ projects, initialProjectId = "" }) {
 
 function EnvironmentsView({ projects, initialProjectId = "" }) {
   const queryClient = useQueryClient();
-  const [projectId, setProjectId] = useState(initialProjectId || projects[0]?.id || "");
+  const [selectedProjectId, setSelectedProjectId] = useState("");
+  const projectId = selectedProjectId || initialProjectId || projects[0]?.id || "";
   const [revealed, setRevealed] = useState({});
   const [editing, setEditing] = useState(null);
   const environments = useQuery({
@@ -616,7 +661,7 @@ function EnvironmentsView({ projects, initialProjectId = "" }) {
     environment.files.map((file) => ({ ...file, environmentName: environment.name }))
   );
   return <section className="environment-screen">
-    <div className="deploy-head"><div><span className="eyebrow">Valores reales en disco</span><h1>Variables</h1></div><div><select value={projectId} onChange={(event) => { setProjectId(event.target.value); setRevealed({}); }}>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select><button className="secondary-button" disabled={!projectId || scan.isPending} onClick={() => scan.mutate()}><RefreshCw size={15} /> {scan.isPending ? "Analizando…" : "Escanear .env"}</button></div></div>
+    <div className="deploy-head"><div><span className="eyebrow">Valores reales en disco</span><h1>Variables</h1></div><div><select value={projectId} onChange={(event) => { setSelectedProjectId(event.target.value); setRevealed({}); }}>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select><button className="secondary-button" disabled={!projectId || scan.isPending} onClick={() => scan.mutate()}><RefreshCw size={15} /> {scan.isPending ? "Analizando…" : "Escanear .env"}</button></div></div>
     <p className="environment-note"><ShieldCheck size={15} /> PostgreSQL solo guarda metadata y fingerprints. Los valores permanecen en cada archivo.</p>
     {(scan.error || environments.error || reveal.error || validate.error || update.error) && <p className="form-error">{(scan.error || environments.error || reveal.error || validate.error || update.error).message}</p>}
     {!files.length && !environments.isPending && <div className="feature-empty compact-empty"><Braces size={27} /><strong>No hay archivos de entorno registrados</strong><span>Escanea la aplicación para detectar `.env` reales.</span></div>}
@@ -783,7 +828,7 @@ function OperationalLogsPanel({ projectId }) {
   </section>;
 }
 
-function ApplicationDetail({ projectId, projects, initialTab, onBack, onTabChange }) {
+function ApplicationDetail({ projectId, projects, initialTab, initialOperation, onBack, onTabChange }) {
   const queryClient = useQueryClient();
   const tab = initialTab || "summary";
   const detail = useQuery({
@@ -823,7 +868,7 @@ function ApplicationDetail({ projectId, projects, initialTab, onBack, onTabChang
       <article className="state-comparison"><h3>Configurado vs observado</h3><div><section><small>Esperado</small><pre>{JSON.stringify(application.expectedState || {}, null, 2)}</pre></section><section><small>Observado</small><pre>{JSON.stringify(application.observedState || {}, null, 2)}</pre></section></div><p>JuanOS no sobrescribe cambios manuales sin confirmación.</p><div className="state-actions"><button onClick={() => acceptObserved.mutate()}>Sincronizar desde observado</button><button onClick={() => onTabChange("deployments")}>Restaurar con plan repair</button><button onClick={() => ignoreObserved.mutate()}>Ignorar 1 hora</button></div>{(acceptObserved.error || ignoreObserved.error) && <p className="form-error">{(acceptObserved.error || ignoreObserved.error).message}</p>}</article>
       {(detail.data.alerts || []).length > 0 && <article><h3>Necesita atención</h3>{detail.data.alerts.map((alert) => <p className={`alert-line ${alert.severity}`} key={alert.id}><AlertTriangle size={15} /> <span><strong>{alert.title}</strong><small>{alert.detail}</small></span></p>)}</article>}
     </div>}
-    {tab === "deployments" && <DeploymentsView projects={projects} initialProjectId={projectId} />}
+    {tab === "deployments" && <DeploymentsView projects={projects} initialProjectId={projectId} initialOperation={initialOperation} />}
     {tab === "logs" && <OperationalLogsPanel projectId={projectId} />}
     {tab === "variables" && <EnvironmentsView projects={projects} initialProjectId={projectId} />}
     {tab === "services" && <div className="service-grid">{(detail.data.services || []).map((service) => <article key={service.id}><Layers3 size={18} /><div><strong>{service.name}</strong><small>{service.serviceType} · {service.status}</small><code>{service.workingDirectory}</code></div></article>)}</div>}
@@ -833,7 +878,7 @@ function ApplicationDetail({ projectId, projects, initialTab, onBack, onTabChang
   </section>;
 }
 
-function OperationsCenter({ projects, initialTab = "alerts", onTabChange }) {
+function OperationsCenter({ projects, initialTab = "alerts", initialOperation = "update", onTabChange, onOpenSslPlan }) {
   const queryClient = useQueryClient();
   const tab = initialTab;
   const alerts = useQuery({ queryKey: ["alerts"], queryFn: () => api("/alerts"), enabled: tab === "alerts" });
@@ -847,8 +892,26 @@ function OperationsCenter({ projects, initialTab = "alerts", onTabChange }) {
     <div className="deploy-head"><div><span className="eyebrow">Historial y atención</span><h1>Actividad</h1></div></div>
     <nav className="detail-tabs"><button className={tab === "alerts" ? "active" : ""} onClick={() => onTabChange("alerts")}><Bell size={14} /> Alertas</button><button className={tab === "deployments" ? "active" : ""} onClick={() => onTabChange("deployments")}><Rocket size={14} /> Despliegues</button><button className={tab === "ssl" ? "active" : ""} onClick={() => onTabChange("ssl")}><LockKeyhole size={14} /> SSL</button><button className={tab === "recovery" ? "active" : ""} onClick={() => onTabChange("recovery")}><HardDrive size={14} /> Recovery</button></nav>
     {tab === "alerts" && <div className="alert-center">{(alerts.data?.alerts || []).map((alert) => <article className={alert.severity} key={alert.id}><AlertTriangle size={18} /><div><strong>{alert.title}</strong><small>{alert.applicationName || "VPS"} · {alert.detail}</small></div><button onClick={() => acknowledge.mutate(alert.id)}>Reconocer</button></article>)}{!alerts.isPending && !alerts.data?.alerts?.length && <div className="feature-empty compact-empty"><ShieldCheck size={28} /><strong>Sin alertas abiertas</strong><span>No hay incidencias materializadas por el worker.</span></div>}</div>}
-    {tab === "deployments" && <DeploymentsView projects={projects} />}
-    {tab === "ssl" && <div className="certificate-grid">{(certificates.data?.certificates || []).map((certificate) => <article key={certificate.id}><LockKeyhole size={19} /><div><strong>{certificate.domain}</strong><small>{certificate.applicationName} · {certificate.issuer || "issuer no observado"}</small></div><b className={certificate.daysRemaining !== null && certificate.daysRemaining <= 7 ? "critical" : certificate.daysRemaining !== null && certificate.daysRemaining <= 30 ? "warning" : ""}>{certificate.daysRemaining === null ? "No verificado" : `${certificate.daysRemaining} días`}</b><small>Renovación: {certificate.lastRenewalResult || "sin probar"}</small></article>)}<button className="secondary-button" onClick={() => onTabChange("deployments")}>Probar renovación desde un plan</button></div>}
+    {tab === "deployments" && <DeploymentsView projects={projects} initialOperation={initialOperation} />}
+    {tab === "ssl" && <div className="certificate-grid">
+      {(certificates.data?.certificates || []).map((certificate) => <article key={certificate.id}>
+        <LockKeyhole size={19} />
+        <div>
+          <strong>{certificate.domain}</strong>
+          <small>{certificate.applicationName || "Dominio aún no asociado"} · {certificate.issuer || "emisor no observado"}</small>
+          <span className="certificate-meta">
+            <time>{certificate.expiresAt ? `Vence el ${new Date(certificate.expiresAt).toLocaleDateString()}` : "Fecha de vencimiento no verificada"}</time>
+            <small>{certificate.autoRenewConfigured ? "Renovación automática detectada" : "Renovación automática no confirmada"}</small>
+            <small>Última prueba: {certificate.error || certificate.lastRenewalResult || "sin ejecutar"}</small>
+          </span>
+        </div>
+        <b className={certificate.daysRemaining !== null && certificate.daysRemaining <= 7 ? "critical" : certificate.daysRemaining !== null && certificate.daysRemaining <= 30 ? "warning" : ""}>{certificate.daysRemaining === null ? "No verificado" : `${certificate.daysRemaining} días`}</b>
+        <button className="secondary-button compact-action" onClick={() => onOpenSslPlan(certificate.applicationId || "")}>{certificate.applicationId ? "Probar renovación" : "Elegir aplicación"}</button>
+      </article>)}
+      {!certificates.isPending && !certificates.data?.certificates?.length && <div className="feature-empty compact-empty"><LockKeyhole size={28} /><strong>Inventario SSL aún no observado</strong><span>El worker actualizará aquí los certificados detectados por Certbot.</span></div>}
+      {certificates.error && <p className="form-error">{certificates.error.message}</p>}
+      <button className="secondary-button" onClick={() => onOpenSslPlan("")}>Probar renovación desde un plan</button>
+    </div>}
     {tab === "recovery" && <div className="recovery-grid">{(recovery.data?.snapshots || []).map((snapshot) => <article key={snapshot.id}><HardDrive size={19} /><div><strong>{snapshot.status} · {snapshot.verificationStatus}</strong><small>{new Date(snapshot.createdAt).toLocaleString()} · {snapshot.remoteProvider || "sin remoto"}</small><code>{snapshot.checksum?.slice(0, 16) || "sin checksum"}</code></div></article>)}<button className="secondary-button" onClick={() => onTabChange("deployments")}>Crear o probar recovery desde un plan</button></div>}
   </section>;
 }
@@ -866,23 +929,42 @@ function SettingsView({ initialTab = "audit", onTabChange }) {
 }
 
 function Dashboard({ user, onLogout }) {
+  const queryClient = useQueryClient();
   const location = useLocation();
   const navigateTo = useNavigate();
   const { active, detail, subtab } = routeFromPath(location.pathname);
+  const requestedOperation = new URLSearchParams(location.search).get("operation") || "update";
   const [showNewProject, setShowNewProject] = useState(false);
   const [showImportProject, setShowImportProject] = useState(false);
   const projectsQuery = useQuery({ queryKey: ["projects"], queryFn: () => api("/projects") });
   const overview = useQuery({ queryKey: ["overview"], queryFn: () => api("/overview") });
   const projects = projectsQuery.data?.projects || [];
+  const removeProject = useMutation({
+    mutationFn: (/** @type {{id: string, name: string}} */ project) => api(`/projects/${project.id}`, { method: "DELETE" }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["projects"] });
+      queryClient.invalidateQueries({ queryKey: ["overview"] });
+    }
+  });
   const alertCount = overview.data?.alerts?.total ?? projects.reduce((total, project) => total + (project.openAlerts || 0), 0);
   const navigate = (section) => {
     navigateTo(pathForSection(section));
   };
   const openDetail = (projectId, tab = "summary") => navigateTo(pathForProject(projectId, tab));
+  const removeFromCatalog = (project) => {
+    if (window.confirm(`¿Quitar “${project.name}” de JuanOS?\n\nSus archivos y servicios en la VPS no se modificarán.`)) {
+      removeProject.mutate(project);
+    }
+  };
+  const openSslPlan = (projectId) => navigateTo(
+    projectId
+      ? `${pathForProject(projectId, "deployments")}?operation=ssl_test`
+      : `${pathForSubtab("Actividad", "deployments")}?operation=ssl_test`
+  );
   const disk = overview.data?.disk;
   return (
     <div className="app-shell">
-      <Sidebar active={active} setActive={navigate} onLogout={onLogout} />
+      <Sidebar active={active} setActive={navigate} onLogout={onLogout} projectCount={projects.length} />
       <main className="workspace">
         <header className="topbar">
           <div className="mobile-brand"><Brand compact /></div>
@@ -890,9 +972,9 @@ function Dashboard({ user, onLogout }) {
           <div className="top-actions"><button className="status-pill"><i className={disk?.status === "critical" ? "off" : ""} /> {disk?.value ? `Disco ${disk.value.usedPercent}%` : "VPS no observada"}</button><button className="avatar" title={user.email}>JC</button></div>
         </header>
         <section className={`content ${active === "Terminal" || detail?.tab === "terminal" || detail?.tab === "files" ? "content-workbench" : ""}`}>
-          {detail ? <ApplicationDetail projectId={detail.projectId} initialTab={detail.tab} projects={projects} onBack={() => navigateTo("/projects")} onTabChange={(tab) => navigateTo(pathForProject(detail.projectId, tab))} />
+          {detail ? <ApplicationDetail projectId={detail.projectId} initialTab={detail.tab} initialOperation={requestedOperation} projects={projects} onBack={() => navigateTo("/projects")} onTabChange={(tab) => navigateTo(pathForProject(detail.projectId, tab))} />
             : active === "Terminal" ? <TerminalView projects={projects} />
-              : active === "Actividad" ? <OperationsCenter projects={projects} initialTab={subtab} onTabChange={(tab) => navigateTo(pathForSubtab("Actividad", tab))} />
+              : active === "Actividad" ? <OperationsCenter projects={projects} initialTab={subtab} initialOperation={requestedOperation} onTabChange={(tab) => navigateTo(pathForSubtab("Actividad", tab))} onOpenSslPlan={openSslPlan} />
                 : active === "Ajustes" ? <SettingsView initialTab={subtab} onTabChange={(tab) => navigateTo(pathForSubtab("Ajustes", tab))} /> : <>
           <div className="title-row">
             <div><span className="eyebrow">Operación de tu VPS</span><h1>{active === "Inicio" ? "Tu VPS, de un vistazo" : "Aplicaciones"}</h1><p>Estado configurado, estado observado y despliegues desde un solo lugar.</p></div>
@@ -907,7 +989,8 @@ function Dashboard({ user, onLogout }) {
           <div className="section-head"><h2>Tus aplicaciones</h2><span>{projects.length} registradas</span></div>
           {projectsQuery.isError && <div className="form-error">No se pudo cargar el catálogo: {projectsQuery.error.message}</div>}
           {!projectsQuery.isPending && !projects.length && <div className="feature-empty compact-empty"><FolderGit2 size={28} /><strong>No hay aplicaciones registradas</strong><span>Importa las que ya existen en la VPS o registra una nueva.</span><button className="secondary-button" onClick={() => setShowImportProject(true)}><Import size={16} /> Descubrir aplicaciones</button></div>}
-          <div className="project-grid">{projects.map((project) => <ProjectCard key={project.id} project={project} onOpen={navigate} onDetail={openDetail} />)}</div>
+          {removeProject.error && <p className="form-error">No se pudo quitar la aplicación: {removeProject.error.message}</p>}
+          <div className="project-grid">{projects.map((project) => <ProjectCard key={project.id} project={project} onOpen={navigate} onDetail={openDetail} onRemove={removeFromCatalog} removing={removeProject.isPending && removeProject.variables?.id === project.id} />)}</div>
           <section className="activity-panel">
             <div className="section-head"><h2>Estado de operación</h2><button onClick={() => navigate("Actividad")}>Ver actividad <ChevronRight size={15} /></button></div>
             <div className="activity-row"><span className="activity-icon green"><ShieldCheck size={17} /></span><div><strong>Fuente de verdad</strong><small>PostgreSQL · importaciones históricas de solo lectura</small></div><code>DB</code><time><Clock3 size={13} /> ahora</time></div>

@@ -41,11 +41,6 @@ await db.query(
    locked_until = NULL, updated_at = now()`,
   [seedUser.email, passwordHash, seedUser.role, seedUser.isActive]
 );
-const examplePath = assertProjectPath(config.PROJECTS_ROOT, `${config.PROJECTS_ROOT}/example`);
-if (process.env.AUTH_SEED_FILE) {
-  await fs.mkdir(examplePath, { recursive: true, mode: 0o750 });
-}
-
 async function seedApplication(input) {
   await db.transaction(async (transaction) => {
     const project = await transaction.query(
@@ -111,21 +106,17 @@ async function seedApplication(input) {
          updated_at = now()`,
       [applicationId, input.serviceName, input.strategy, input.localPath]
     );
+    if (input.domain) {
+      await transaction.query(
+        `INSERT INTO application_domains (application_id, hostname, is_primary)
+         VALUES ($1,$2,true)
+         ON CONFLICT (application_id, hostname) DO UPDATE SET
+          is_primary = true, updated_at = now()`,
+        [applicationId, input.domain]
+      );
+    }
   });
 }
-
-await seedApplication({
-  name: "Proyecto de ejemplo",
-  slug: "example",
-  localPath: examplePath,
-  repositoryUrl: "https://github.com/example/example.git",
-  defaultBranch: "main",
-  deploymentType: "docker-compose",
-  serviceName: "example",
-  applicationType: "other",
-  strategy: "docker_compose",
-  isJuanOS: false
-});
 
 if (process.env.JUANOS_PROJECT_PATH && process.env.JUANOS_REPOSITORY_URL) {
   const juanosPath = assertProjectPath(config.PROJECTS_ROOT, process.env.JUANOS_PROJECT_PATH);
@@ -139,7 +130,8 @@ if (process.env.JUANOS_PROJECT_PATH && process.env.JUANOS_REPOSITORY_URL) {
     serviceName: "juanos",
     applicationType: "fullstack",
     strategy: "docker_compose",
-    isJuanOS: true
+    isJuanOS: true,
+    domain: process.env.JUANOS_DOMAIN || null
   });
 }
 await db.close();
