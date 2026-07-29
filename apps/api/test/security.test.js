@@ -150,3 +150,11 @@ test("la migración impide dos despliegues activos del mismo proyecto", async ()
   assert.match(migration, /UNIQUE INDEX deployments_one_active_per_project_idx/);
   assert.match(migration, /status IN \('queued', 'running'\)/);
 });
+
+test("self-update instala herramientas de build aunque el worker esté en producción", async () => {
+  const script = await fs.readFile(
+    new URL("../../../scripts/juanos-self-update", import.meta.url),
+    "utf8"
+  );
+  assert.match(script, /command\("npm", \["ci", "--include=dev"\]/);
+});

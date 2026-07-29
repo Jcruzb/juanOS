@@ -203,7 +203,8 @@ Google Drive, sin almacenar OAuth en PostgreSQL.
 `scripts/juanos-recover` funciona por SSH con la interfaz caída: status, logs, restart, version,
 snapshots y rollback de release.
 
-`scripts/juanos-self-update` prepara una release, ejecuta `npm ci`, build y migraciones, valida,
+`scripts/juanos-self-update` prepara una release, ejecuta `npm ci --include=dev` para disponer
+de las herramientas de compilación incluso con `NODE_ENV=production`, ejecuta build y migraciones, valida,
 activa el symlink y programa reinicios separados de API y worker. El plan JuanOS obliga a crear un
 recovery antes.
 

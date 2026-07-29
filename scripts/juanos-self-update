@@ -79,7 +79,9 @@ async function update(value, deploymentId) {
     "--exclude", ".env", `${projectRoot}/`, `${release}/`
   ]);
   const environment = environmentFromFile(value.environmentFile);
-  await command("npm", ["ci"], { cwd: release, env: environment });
+  // El worker se ejecuta con NODE_ENV=production, pero el release necesita
+  // herramientas de compilación como Vite antes de poder activarse.
+  await command("npm", ["ci", "--include=dev"], { cwd: release, env: environment });
   await command("npm", ["run", "build"], { cwd: release, env: environment });
   await command("npm", ["run", "db:migrate", "-w", "@juanos/api"], { cwd: release, env: environment });
   await command("node", ["--check", "apps/api/src/server.js"], { cwd: release, env: environment });
