@@ -11,6 +11,10 @@ import { gitArgsForAction } from "../src/git.js";
 import { attachTerminalServer, isAllowedWsOrigin, terminalOptions } from "../src/terminal.js";
 import { validateDeployScript } from "../src/deployments.js";
 import { fileDeleteSchema, fileEntrySchema, fileRenameSchema, fileSearchSchema } from "@juanos/shared";
+import {
+  pathForProject, pathForSection, pathForSubtab, routeFromPath
+} from "../../web/src/navigation.js";
+import { api, onUnauthorized } from "../../web/src/api.js";
 
 test("permite una ruta hija del directorio de proyectos", () => {
   assert.equal(assertProjectPath("/srv/juanos/projects", "/srv/juanos/projects/app"), "/srv/juanos/projects/app");
@@ -157,4 +161,58 @@ test("self-update instala herramientas de build aunque el worker esté en produc
     "utf8"
   );
   assert.match(script, /command\("npm", \["ci", "--include=dev"\]/);
+});
+
+test("la URL conserva sección, aplicación y pestaña tras una recarga", () => {
+  assert.equal(pathForSection("Actividad"), "/activity/alerts");
+  assert.deepEqual(routeFromPath("/activity/recovery"), {
+    active: "Actividad", detail: null, subtab: "recovery"
+  });
+  assert.deepEqual(routeFromPath("/projects/project-1/logs"), {
+    active: "Proyectos",
+    detail: { projectId: "project-1", tab: "logs" },
+    subtab: null
+  });
+  assert.equal(pathForProject("project/1", "deployments"), "/projects/project%2F1/deployments");
+  assert.equal(pathForSubtab("Ajustes", "logs"), "/settings/logs");
+});
+
+test("una respuesta 401 notifica inmediatamente que la sesión ha vencido", async () => {
+  const originalFetch = globalThis.fetch;
+  let notifications = 0;
+  const unsubscribe = onUnauthorized(() => { notifications += 1; });
+  globalThis.fetch = async () => ({
+    status: 401,
+    ok: false,
+    json: async () => ({
+      error: { code: "SESSION_EXPIRED", message: "La sesión ha expirado" }
+    })
+  });
+  try {
+    await assert.rejects(() => api("/auth/me"), /sesión ha expirado/);
+    assert.equal(notifications, 1);
+  } finally {
+    unsubscribe();
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("un login incorrecto no se confunde con una sesión vencida", async () => {
+  const originalFetch = globalThis.fetch;
+  let notifications = 0;
+  const unsubscribe = onUnauthorized(() => { notifications += 1; });
+  globalThis.fetch = async () => ({
+    status: 401,
+    ok: false,
+    json: async () => ({
+      error: { code: "INVALID_CREDENTIALS", message: "Credenciales no válidas" }
+    })
+  });
+  try {
+    await assert.rejects(() => api("/auth/login"), /Credenciales no válidas/);
+    assert.equal(notifications, 0);
+  } finally {
+    unsubscribe();
+    globalThis.fetch = originalFetch;
+  }
 });

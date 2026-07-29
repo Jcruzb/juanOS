@@ -1,5 +1,6 @@
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useLocation, useNavigate } from "react-router-dom";
 import {
   Activity, ArrowUpRight, Braces, ChevronRight, CircleDot, Clock3,
   Code2, FileCode2, FilePlus2, FolderGit2, FolderPlus, GitBranch, GitCommitHorizontal,
@@ -7,7 +8,10 @@ import {
   Settings, ShieldCheck, TerminalSquare, Trash2, UploadCloud, Wifi, AlertTriangle, Eye, EyeOff,
   Bell, LockKeyhole, HardDrive, Pause, Play, Copy, ArrowLeft, X, Layers3
 } from "lucide-react";
-import { api, setCsrfToken } from "./api.js";
+import { api, onUnauthorized, setCsrfToken } from "./api.js";
+import {
+  pathForProject, pathForSection, pathForSubtab, routeFromPath
+} from "./navigation.js";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
@@ -778,9 +782,9 @@ function OperationalLogsPanel({ projectId }) {
   </section>;
 }
 
-function ApplicationDetail({ projectId, projects, initialTab, onBack }) {
+function ApplicationDetail({ projectId, projects, initialTab, onBack, onTabChange }) {
   const queryClient = useQueryClient();
-  const [tab, setTab] = useState(initialTab || "summary");
+  const tab = initialTab || "summary";
   const detail = useQuery({
     queryKey: ["application", projectId],
     queryFn: () => api(`/projects/${projectId}`)
@@ -811,11 +815,11 @@ function ApplicationDetail({ projectId, projects, initialTab, onBack }) {
       <div><span className="eyebrow">{application.applicationType} · {application.strategy}</span><h1>{application.name}</h1></div>
       {application.isJuanOS && <span className="self-badge"><ShieldCheck size={12} /> ESTA APLICACIÓN</span>}
     </header>
-    <nav className="detail-tabs">{tabs.map(([id, label]) => <button className={tab === id ? "active" : ""} key={id} onClick={() => setTab(id)}>{label}</button>)}</nav>
+    <nav className="detail-tabs">{tabs.map(([id, label]) => <button className={tab === id ? "active" : ""} key={id} onClick={() => onTabChange(id)}>{label}</button>)}</nav>
     {tab === "summary" && <div className="detail-summary">
       <article><h3>Estado</h3><dl><div><dt>Proceso</dt><dd>{application.processStatus || "no comprobado"}</dd></div><div><dt>HTTP</dt><dd>{application.httpHealthStatus || "no comprobado"}</dd></div><div><dt>Funcional</dt><dd>{application.functionalHealthStatus || "no comprobado"}</dd></div><div><dt>Último deploy</dt><dd>{application.lastDeploymentStatus || "sin despliegues"}</dd></div></dl></article>
       <article><h3>Commits</h3><dl><div><dt>Repositorio</dt><dd><code>{application.repositoryCommitSha?.slice(0, 12) || "—"}</code></dd></div><div><dt>Desplegado</dt><dd><code>{application.deployedCommitSha?.slice(0, 12) || "no registrado"}</code></dd></div><div><dt>Remoto</dt><dd><code>{application.lastRemoteCommitSha?.slice(0, 12) || "no inspeccionado"}</code></dd></div></dl></article>
-      <article className="state-comparison"><h3>Configurado vs observado</h3><div><section><small>Esperado</small><pre>{JSON.stringify(application.expectedState || {}, null, 2)}</pre></section><section><small>Observado</small><pre>{JSON.stringify(application.observedState || {}, null, 2)}</pre></section></div><p>JuanOS no sobrescribe cambios manuales sin confirmación.</p><div className="state-actions"><button onClick={() => acceptObserved.mutate()}>Sincronizar desde observado</button><button onClick={() => setTab("deployments")}>Restaurar con plan repair</button><button onClick={() => ignoreObserved.mutate()}>Ignorar 1 hora</button></div>{(acceptObserved.error || ignoreObserved.error) && <p className="form-error">{(acceptObserved.error || ignoreObserved.error).message}</p>}</article>
+      <article className="state-comparison"><h3>Configurado vs observado</h3><div><section><small>Esperado</small><pre>{JSON.stringify(application.expectedState || {}, null, 2)}</pre></section><section><small>Observado</small><pre>{JSON.stringify(application.observedState || {}, null, 2)}</pre></section></div><p>JuanOS no sobrescribe cambios manuales sin confirmación.</p><div className="state-actions"><button onClick={() => acceptObserved.mutate()}>Sincronizar desde observado</button><button onClick={() => onTabChange("deployments")}>Restaurar con plan repair</button><button onClick={() => ignoreObserved.mutate()}>Ignorar 1 hora</button></div>{(acceptObserved.error || ignoreObserved.error) && <p className="form-error">{(acceptObserved.error || ignoreObserved.error).message}</p>}</article>
       {(detail.data.alerts || []).length > 0 && <article><h3>Necesita atención</h3>{detail.data.alerts.map((alert) => <p className={`alert-line ${alert.severity}`} key={alert.id}><AlertTriangle size={15} /> <span><strong>{alert.title}</strong><small>{alert.detail}</small></span></p>)}</article>}
     </div>}
     {tab === "deployments" && <DeploymentsView projects={projects} initialProjectId={projectId} />}
@@ -828,9 +832,9 @@ function ApplicationDetail({ projectId, projects, initialTab, onBack }) {
   </section>;
 }
 
-function OperationsCenter({ projects }) {
+function OperationsCenter({ projects, initialTab = "alerts", onTabChange }) {
   const queryClient = useQueryClient();
-  const [tab, setTab] = useState("alerts");
+  const tab = initialTab;
   const alerts = useQuery({ queryKey: ["alerts"], queryFn: () => api("/alerts"), enabled: tab === "alerts" });
   const certificates = useQuery({ queryKey: ["certificates"], queryFn: () => api("/certificates"), enabled: tab === "ssl" });
   const recovery = useQuery({ queryKey: ["recovery"], queryFn: () => api("/recovery-snapshots"), enabled: tab === "recovery" });
@@ -840,29 +844,30 @@ function OperationsCenter({ projects }) {
   });
   return <section className="operations-center">
     <div className="deploy-head"><div><span className="eyebrow">Historial y atención</span><h1>Actividad</h1></div></div>
-    <nav className="detail-tabs"><button className={tab === "alerts" ? "active" : ""} onClick={() => setTab("alerts")}><Bell size={14} /> Alertas</button><button className={tab === "deployments" ? "active" : ""} onClick={() => setTab("deployments")}><Rocket size={14} /> Despliegues</button><button className={tab === "ssl" ? "active" : ""} onClick={() => setTab("ssl")}><LockKeyhole size={14} /> SSL</button><button className={tab === "recovery" ? "active" : ""} onClick={() => setTab("recovery")}><HardDrive size={14} /> Recovery</button></nav>
+    <nav className="detail-tabs"><button className={tab === "alerts" ? "active" : ""} onClick={() => onTabChange("alerts")}><Bell size={14} /> Alertas</button><button className={tab === "deployments" ? "active" : ""} onClick={() => onTabChange("deployments")}><Rocket size={14} /> Despliegues</button><button className={tab === "ssl" ? "active" : ""} onClick={() => onTabChange("ssl")}><LockKeyhole size={14} /> SSL</button><button className={tab === "recovery" ? "active" : ""} onClick={() => onTabChange("recovery")}><HardDrive size={14} /> Recovery</button></nav>
     {tab === "alerts" && <div className="alert-center">{(alerts.data?.alerts || []).map((alert) => <article className={alert.severity} key={alert.id}><AlertTriangle size={18} /><div><strong>{alert.title}</strong><small>{alert.applicationName || "VPS"} · {alert.detail}</small></div><button onClick={() => acknowledge.mutate(alert.id)}>Reconocer</button></article>)}{!alerts.isPending && !alerts.data?.alerts?.length && <div className="feature-empty compact-empty"><ShieldCheck size={28} /><strong>Sin alertas abiertas</strong><span>No hay incidencias materializadas por el worker.</span></div>}</div>}
     {tab === "deployments" && <DeploymentsView projects={projects} />}
-    {tab === "ssl" && <div className="certificate-grid">{(certificates.data?.certificates || []).map((certificate) => <article key={certificate.id}><LockKeyhole size={19} /><div><strong>{certificate.domain}</strong><small>{certificate.applicationName} · {certificate.issuer || "issuer no observado"}</small></div><b className={certificate.daysRemaining !== null && certificate.daysRemaining <= 7 ? "critical" : certificate.daysRemaining !== null && certificate.daysRemaining <= 30 ? "warning" : ""}>{certificate.daysRemaining === null ? "No verificado" : `${certificate.daysRemaining} días`}</b><small>Renovación: {certificate.lastRenewalResult || "sin probar"}</small></article>)}<button className="secondary-button" onClick={() => setTab("deployments")}>Probar renovación desde un plan</button></div>}
-    {tab === "recovery" && <div className="recovery-grid">{(recovery.data?.snapshots || []).map((snapshot) => <article key={snapshot.id}><HardDrive size={19} /><div><strong>{snapshot.status} · {snapshot.verificationStatus}</strong><small>{new Date(snapshot.createdAt).toLocaleString()} · {snapshot.remoteProvider || "sin remoto"}</small><code>{snapshot.checksum?.slice(0, 16) || "sin checksum"}</code></div></article>)}<button className="secondary-button" onClick={() => setTab("deployments")}>Crear o probar recovery desde un plan</button></div>}
+    {tab === "ssl" && <div className="certificate-grid">{(certificates.data?.certificates || []).map((certificate) => <article key={certificate.id}><LockKeyhole size={19} /><div><strong>{certificate.domain}</strong><small>{certificate.applicationName} · {certificate.issuer || "issuer no observado"}</small></div><b className={certificate.daysRemaining !== null && certificate.daysRemaining <= 7 ? "critical" : certificate.daysRemaining !== null && certificate.daysRemaining <= 30 ? "warning" : ""}>{certificate.daysRemaining === null ? "No verificado" : `${certificate.daysRemaining} días`}</b><small>Renovación: {certificate.lastRenewalResult || "sin probar"}</small></article>)}<button className="secondary-button" onClick={() => onTabChange("deployments")}>Probar renovación desde un plan</button></div>}
+    {tab === "recovery" && <div className="recovery-grid">{(recovery.data?.snapshots || []).map((snapshot) => <article key={snapshot.id}><HardDrive size={19} /><div><strong>{snapshot.status} · {snapshot.verificationStatus}</strong><small>{new Date(snapshot.createdAt).toLocaleString()} · {snapshot.remoteProvider || "sin remoto"}</small><code>{snapshot.checksum?.slice(0, 16) || "sin checksum"}</code></div></article>)}<button className="secondary-button" onClick={() => onTabChange("deployments")}>Crear o probar recovery desde un plan</button></div>}
   </section>;
 }
 
-function SettingsView() {
-  const [tab, setTab] = useState("audit");
+function SettingsView({ initialTab = "audit", onTabChange }) {
+  const tab = initialTab;
   const audit = useQuery({ queryKey: ["audit"], queryFn: () => api("/audit") });
   const logs = useQuery({ queryKey: ["logs"], queryFn: () => api("/logs"), enabled: tab === "logs" });
   return <section className="audit-screen">
     <div className="deploy-head"><div><span className="eyebrow">Seguridad y diagnóstico</span><h1>{tab === "audit" ? "Auditoría" : "Logs permitidos"}</h1></div></div>
-    <div className="settings-tabs"><button className={tab === "audit" ? "active" : ""} onClick={() => setTab("audit")}><ShieldCheck size={14} /> Auditoría</button><button className={tab === "logs" ? "active" : ""} onClick={() => setTab("logs")}><Activity size={14} /> Despliegues</button></div>
+    <div className="settings-tabs"><button className={tab === "audit" ? "active" : ""} onClick={() => onTabChange("audit")}><ShieldCheck size={14} /> Auditoría</button><button className={tab === "logs" ? "active" : ""} onClick={() => onTabChange("logs")}><Activity size={14} /> Despliegues</button></div>
     {tab === "audit" ? <div className="deployment-list">{(audit.data?.entries || []).map((entry) => <article key={entry.id}><span className="activity-icon violet"><ShieldCheck size={15} /></span><div><strong>{entry.action}</strong><small>{entry.resourceType} · {entry.resourceId || "sistema"}</small></div><code>{entry.ipAddress || "local"}</code><time>{new Date(entry.createdAt).toLocaleString()}</time></article>)}</div>
       : <div className="allowed-logs">{(logs.data?.logs || []).map((entry) => <article key={entry.id}><header><strong>{entry.project}</strong><span className={`deployment-status ${entry.status}`} /> <b>{entry.status}</b><time>{new Date(entry.startedAt).toLocaleString()}</time></header><pre>{entry.output || entry.error || "Sin salida registrada."}</pre></article>)}{!logs.data?.logs?.length && <div className="feature-empty"><Activity size={28} /><strong>Sin logs de despliegue</strong><span>JuanOS no muestra logs globales del sistema.</span></div>}</div>}
   </section>;
 }
 
 function Dashboard({ user, onLogout }) {
-  const [active, setActive] = useState("Inicio");
-  const [detail, setDetail] = useState(null);
+  const location = useLocation();
+  const navigateTo = useNavigate();
+  const { active, detail, subtab } = routeFromPath(location.pathname);
   const [showNewProject, setShowNewProject] = useState(false);
   const [showImportProject, setShowImportProject] = useState(false);
   const projectsQuery = useQuery({ queryKey: ["projects"], queryFn: () => api("/projects") });
@@ -870,10 +875,9 @@ function Dashboard({ user, onLogout }) {
   const projects = projectsQuery.data?.projects || [];
   const alertCount = overview.data?.alerts?.total ?? projects.reduce((total, project) => total + (project.openAlerts || 0), 0);
   const navigate = (section) => {
-    setDetail(null);
-    setActive(section);
+    navigateTo(pathForSection(section));
   };
-  const openDetail = (projectId, tab = "summary") => setDetail({ projectId, tab });
+  const openDetail = (projectId, tab = "summary") => navigateTo(pathForProject(projectId, tab));
   const disk = overview.data?.disk;
   return (
     <div className="app-shell">
@@ -885,10 +889,10 @@ function Dashboard({ user, onLogout }) {
           <div className="top-actions"><button className="status-pill"><i className={disk?.status === "critical" ? "off" : ""} /> {disk?.value ? `Disco ${disk.value.usedPercent}%` : "VPS no observada"}</button><button className="avatar" title={user.email}>JC</button></div>
         </header>
         <section className={`content ${active === "Terminal" || detail?.tab === "terminal" || detail?.tab === "files" ? "content-workbench" : ""}`}>
-          {detail ? <ApplicationDetail projectId={detail.projectId} initialTab={detail.tab} projects={projects} onBack={() => setDetail(null)} />
+          {detail ? <ApplicationDetail projectId={detail.projectId} initialTab={detail.tab} projects={projects} onBack={() => navigateTo("/projects")} onTabChange={(tab) => navigateTo(pathForProject(detail.projectId, tab))} />
             : active === "Terminal" ? <TerminalView projects={projects} />
-              : active === "Actividad" ? <OperationsCenter projects={projects} />
-                : active === "Ajustes" ? <SettingsView /> : <>
+              : active === "Actividad" ? <OperationsCenter projects={projects} initialTab={subtab} onTabChange={(tab) => navigateTo(pathForSubtab("Actividad", tab))} />
+                : active === "Ajustes" ? <SettingsView initialTab={subtab} onTabChange={(tab) => navigateTo(pathForSubtab("Ajustes", tab))} /> : <>
           <div className="title-row">
             <div><span className="eyebrow">Operación de tu VPS</span><h1>{active === "Inicio" ? "Tu VPS, de un vistazo" : "Aplicaciones"}</h1><p>Estado configurado, estado observado y despliegues desde un solo lugar.</p></div>
             <div className="title-actions"><button className="secondary-button" onClick={() => setShowImportProject(true)}><Import size={17} /> Importar</button><button className="primary-button small" onClick={() => setShowNewProject(true)}><Plus size={18} /> Nueva</button></div>
@@ -922,14 +926,36 @@ export default function App() {
   const queryClient = useQueryClient();
   const [user, setUser] = useState(null);
   const [checking, setChecking] = useState(true);
+  useEffect(() => onUnauthorized(() => {
+    setUser(null);
+    queryClient.clear();
+  }), [queryClient]);
   useEffect(() => {
     api("/auth/me").then((data) => { setCsrfToken(data.csrfToken); setUser(data.user); }).catch(() => {}).finally(() => setChecking(false));
   }, []);
+  useEffect(() => {
+    if (!user) return undefined;
+    const checkSession = () => {
+      api("/auth/me").then((data) => setCsrfToken(data.csrfToken)).catch(() => {});
+    };
+    const interval = window.setInterval(checkSession, 60_000);
+    const checkWhenVisible = () => {
+      if (document.visibilityState === "visible") checkSession();
+    };
+    document.addEventListener("visibilitychange", checkWhenVisible);
+    return () => {
+      window.clearInterval(interval);
+      document.removeEventListener("visibilitychange", checkWhenVisible);
+    };
+  }, [user]);
   const logout = async () => {
-    await api("/auth/logout", { method: "POST" });
-    setCsrfToken("");
-    setUser(null);
-    queryClient.clear();
+    try {
+      await api("/auth/logout", { method: "POST" });
+    } finally {
+      setCsrfToken("");
+      setUser(null);
+      queryClient.clear();
+    }
   };
   if (checking) return <div className="boot"><Brand /><span>Preparando espacio seguro…</span></div>;
   return user ? <Dashboard user={user} onLogout={logout} /> : <Login onSuccess={setUser} />;
