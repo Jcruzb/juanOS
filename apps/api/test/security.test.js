@@ -177,6 +177,16 @@ test("el sandbox del worker permite solo las rutas root-owned que usan los helpe
   assert.match(unit, /^ReadWritePaths=.*\/usr\/local\/bin(?:\s|$)/m);
 });
 
+test("el broker de logs limita concurrencia sin bloquear la cola completa", async () => {
+  const worker = await fs.readFile(
+    new URL("../src/operational-logs.js", import.meta.url),
+    "utf8"
+  );
+  assert.match(worker, /MAX_CONCURRENT_OPERATIONAL_LOGS = 4/);
+  assert.match(worker, /while \(activeTasks\.size < MAX_CONCURRENT_OPERATIONAL_LOGS\)/);
+  assert.match(worker, /processOperationalLogSession\(\{ session, db, config \}\)/);
+});
+
 test("la URL conserva sección, aplicación y pestaña tras una recarga", () => {
   assert.equal(pathForSection("Actividad"), "/activity/alerts");
   assert.deepEqual(routeFromPath("/activity/recovery"), {

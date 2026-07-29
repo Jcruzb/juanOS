@@ -739,6 +739,7 @@ function OperationalLogsPanel({ projectId }) {
       ? "Esperando salida de la fuente autorizada…"
       : `El stream terminó con estado ${session.status}.`
     : "Selecciona una fuente y abre el stream.";
+  const streamActive = Boolean(session && !["finished", "failed", "cancelled"].includes(session.status));
   return <section className="operational-logs">
     {authorizationRequired && <div className="warning-box observability-authorization">
       <AlertTriangle size={16} />
@@ -769,13 +770,13 @@ function OperationalLogsPanel({ projectId }) {
       }}>{(sources.data?.sources || []).map((item) => <option value={item.id} key={item.id}>{item.label}</option>)}</select>
       {(selectedSource?.services?.length || selectedSource?.service) && <select value={activeService} onChange={(event) => setService(event.target.value)}>{(selectedSource.services || [selectedSource.service]).filter(Boolean).map((name) => <option value={name} key={name}>{name}</option>)}</select>}
       <select value={lines} onChange={(event) => setLines(Number(event.target.value))}><option value={100}>100 líneas</option><option value={500}>500 líneas</option><option value={1000}>1000 líneas</option></select>
-      <button className="primary-button small" disabled={!activeSource || start.isPending || authorizationRequired} onClick={() => start.mutate()}><Play size={14} /> Abrir stream</button>
+      <button className="primary-button small" disabled={!activeSource || start.isPending || authorizationRequired || streamActive} onClick={() => start.mutate()}><Play size={14} /> {streamActive ? "Stream abierto" : "Abrir stream"}</button>
     </div>
     <div className="log-tools">
       <label><Search size={14} /><input placeholder="Buscar en logs" value={query} onChange={(event) => setQuery(event.target.value)} /></label>
       <button onClick={() => paused ? resume() : setPaused(true)}>{paused ? <Play size={14} /> : <Pause size={14} />}{paused ? " Reanudar" : " Pausar"}</button>
       <button onClick={() => navigator.clipboard.writeText(filtered)}><Copy size={14} /> Copiar</button>
-      {session && !["finished", "failed", "cancelled"].includes(session.status) && <button onClick={() => cancel.mutate()}><X size={14} /> Cerrar</button>}
+      {streamActive && <button onClick={() => cancel.mutate()}><X size={14} /> Cerrar</button>}
     </div>
     {(sources.error || authorize.error || start.error || cancel.error) && <p className="form-error">{(sources.error || authorize.error || start.error || cancel.error).message}</p>}
     <pre className="live-log operational-output">{filtered || (sources.isPending ? "Buscando fuentes permitidas…" : emptyMessage)}</pre>

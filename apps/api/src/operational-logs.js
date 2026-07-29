@@ -18,6 +18,7 @@ const authorizeObservabilitySchema = z.object({ confirm: z.literal(true) });
 const PRIVILEGED_LOG_SOURCES = new Set([
   "systemd", "docker_compose", "nginx_access", "nginx_error"
 ]);
+const MAX_CONCURRENT_OPERATIONAL_LOGS = 4;
 
 function authorizationStatus(application) {
   if (application.authorizationStatus) return application.authorizationStatus;
@@ -353,9 +354,7 @@ async function executeLogSession(session, config, append) {
   return child;
 }
 
-export async function runOperationalLogWorkerOnce({ db, config, workerId }) {
-  const session = await claimLogSession(db, workerId);
-  if (!session) return false;
+async function processOperationalLogSession({ session, db, config }) {
   const directory = path.join(config.DEPLOY_LOGS_DIR, "operations");
   await fs.mkdir(directory, { recursive: true, mode: 0o700 });
   await fs.chmod(directory, 0o700);
@@ -405,6 +404,12 @@ export async function runOperationalLogWorkerOnce({ db, config, workerId }) {
       [session.id, finalStatus, finalError]
     );
   }
+}
+
+export async function runOperationalLogWorkerOnce({ db, config, workerId }) {
+  const session = await claimLogSession(db, workerId);
+  if (!session) return false;
+  await processOperationalLogSession({ session, db, config });
   return true;
 }
 
@@ -412,16 +417,45 @@ export function startOperationalLogWorker({ db, config }) {
   const workerId = `logs-${process.pid}`;
   let stopped = false;
   let timer;
-  const tick = async () => {
+  let ticking = false;
+  const activeTasks = new Set();
+  const schedule = (delay) => {
     if (stopped) return;
-    try {
-      const handled = await runOperationalLogWorkerOnce({ db, config, workerId });
-      const authorizationHandled = await runObservabilityAuthorizationWorkerOnce({ db, config });
-      timer = setTimeout(tick, handled || authorizationHandled ? 50 : 1000);
-    } catch {
-      timer = setTimeout(tick, 3000);
-    }
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => {
+      timer = null;
+      tick();
+    }, delay);
     timer.unref();
+  };
+  const startSession = (session) => {
+    let task;
+    task = processOperationalLogSession({ session, db, config })
+      .catch(() => {})
+      .finally(() => {
+        activeTasks.delete(task);
+        schedule(0);
+      });
+    activeTasks.add(task);
+  };
+  const tick = async () => {
+    if (stopped || ticking) return;
+    ticking = true;
+    try {
+      const authorizationHandled = await runObservabilityAuthorizationWorkerOnce({ db, config });
+      let claimed = false;
+      while (activeTasks.size < MAX_CONCURRENT_OPERATIONAL_LOGS) {
+        const session = await claimLogSession(db, workerId);
+        if (!session) break;
+        claimed = true;
+        startSession(session);
+      }
+      schedule(claimed || authorizationHandled ? 50 : 1000);
+    } catch {
+      schedule(3000);
+    } finally {
+      ticking = false;
+    }
   };
   db.query(
     `UPDATE operational_log_sessions SET status = 'failed',
