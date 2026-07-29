@@ -59,6 +59,45 @@ function command(executable, args, options = {}) {
   });
 }
 
+function installRootExecutable(source, target, allowedDirectory) {
+  if (!path.isAbsolute(target) || path.dirname(target) !== allowedDirectory) {
+    fail(`Destino de helper no permitido: ${target}`);
+  }
+  const sourceStat = fs.lstatSync(source);
+  if (!sourceStat.isFile() || sourceStat.isSymbolicLink()) {
+    fail(`Helper de release inválido: ${path.basename(source)}`);
+  }
+  const directoryStat = fs.lstatSync(allowedDirectory);
+  if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink() || directoryStat.uid !== 0) {
+    fail(`Directorio de helpers inseguro: ${allowedDirectory}`);
+  }
+  const temporary = `${target}.juanos-next-${process.pid}`;
+  try {
+    fs.copyFileSync(source, temporary, fs.constants.COPYFILE_EXCL);
+    fs.chownSync(temporary, 0, 0);
+    fs.chmodSync(temporary, 0o755);
+    fs.renameSync(temporary, target);
+  } finally {
+    fs.rmSync(temporary, { force: true });
+  }
+}
+
+function syncReleaseExecutables(release, environment) {
+  const helpers = [
+    ["juanos-host-action", environment.JUANOS_HOST_HELPER || "/usr/local/libexec/juanos-host-action"],
+    ["juanos-recovery", environment.JUANOS_RECOVERY_HELPER || "/usr/local/libexec/juanos-recovery"],
+    ["juanos-self-update", environment.JUANOS_SELF_UPDATE_HELPER || "/usr/local/libexec/juanos-self-update"]
+  ];
+  for (const [name, target] of helpers) {
+    installRootExecutable(path.join(release, "scripts", name), target, "/usr/local/libexec");
+  }
+  installRootExecutable(
+    path.join(release, "scripts", "juanos-recover"),
+    "/usr/local/bin/juanos-recover",
+    "/usr/local/bin"
+  );
+}
+
 async function update(value, deploymentId) {
   const projectRoot = fs.realpathSync(value.projectRoot);
   const installRoot = fs.realpathSync(value.installRoot);
@@ -86,6 +125,7 @@ async function update(value, deploymentId) {
   await command("npm", ["run", "db:migrate", "-w", "@juanos/api"], { cwd: release, env: environment });
   await command("node", ["--check", "apps/api/src/server.js"], { cwd: release, env: environment });
   fs.writeFileSync(path.join(release, "VERSION"), `${commitResult}\n`, { mode: 0o644 });
+  syncReleaseExecutables(release, environment);
   const current = path.join(installRoot, "current");
   const next = path.join(installRoot, ".current-next");
   fs.rmSync(next, { force: true });

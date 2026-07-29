@@ -205,8 +205,13 @@ snapshots y rollback de release.
 
 `scripts/juanos-self-update` prepara una release, ejecuta `npm ci --include=dev` para disponer
 de las herramientas de compilación incluso con `NODE_ENV=production`, ejecuta build y migraciones, valida,
+sincroniza de forma atómica los helpers privilegiados root-owned,
 activa el symlink y programa reinicios separados de API y worker. El plan JuanOS obliga a crear un
 recovery antes.
+
+La unidad del worker mantiene `ProtectSystem=full`; solo expone como escribibles los directorios
+root-owned usados por los helpers, incluido `/etc/juanos` para actualizar la política mediante
+reemplazo atómico y `/usr/local/libexec` para sincronizar sus ejecutables.
 
 ### UX móvil
 

@@ -161,6 +161,20 @@ test("self-update instala herramientas de build aunque el worker esté en produc
     "utf8"
   );
   assert.match(script, /command\("npm", \["ci", "--include=dev"\]/);
+  assert.match(script, /syncReleaseExecutables\(release, environment\)/);
+  assert.match(script, /\["juanos-host-action", environment\.JUANOS_HOST_HELPER/);
+  assert.match(script, /fs\.renameSync\(temporary, target\)/);
+});
+
+test("el sandbox del worker permite solo las rutas root-owned que usan los helpers", async () => {
+  const unit = await fs.readFile(
+    new URL("../../../infra/systemd/juanos-worker.service", import.meta.url),
+    "utf8"
+  );
+  assert.match(unit, /^ProtectSystem=full$/m);
+  assert.match(unit, /^ReadWritePaths=.*\/etc\/juanos(?:\s|$)/m);
+  assert.match(unit, /^ReadWritePaths=.*\/usr\/local\/libexec(?:\s|$)/m);
+  assert.match(unit, /^ReadWritePaths=.*\/usr\/local\/bin(?:\s|$)/m);
 });
 
 test("la URL conserva sección, aplicación y pestaña tras una recarga", () => {
