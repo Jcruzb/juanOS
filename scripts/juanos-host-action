@@ -367,6 +367,15 @@ async function runAction(action, values, app) {
   if (action.startsWith("compose-")) {
     const composeFile = composeTarget(app, values);
     const base = ["compose", "--file", composeFile];
+    if (app.compose?.envFile) {
+      const envFile = app.compose.envFile;
+      if (!path.isAbsolute(envFile)) fail("Compose envFile debe ser absoluto");
+      const stat = fs.lstatSync(envFile);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.uid !== 0 || (stat.mode & 0o022)) {
+        fail("Compose envFile debe ser un archivo root-owned no modificable");
+      }
+      base.push("--env-file", envFile);
+    }
     if (action === "compose-pull") await command("docker", [...base, "pull"], { cwd: projectPath });
     if (action === "compose-build") await command("docker", [...base, "build"], { cwd: projectPath });
     if (action === "compose-up") await command("docker", [...base, "up", "-d", "--remove-orphans"], { cwd: projectPath });

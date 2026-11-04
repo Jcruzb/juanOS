@@ -90,3 +90,7 @@ juanos-recover snapshots
 
 Consulta [`juanos-platform-implementation.md`](./juanos-platform-implementation.md) para la guía
 completa y el checklist E2E.
+
+### Variables de Compose fuera del checkout
+
+Si un stack existente usa un archivo de variables externo, configura `compose.envFile` en su entrada de `/etc/juanos/host-policy.json` (por ejemplo, `/etc/juanos/compose.env` para JuanOS). Debe ser una ruta absoluta a un archivo regular propiedad de root y no modificable por grupo u otros. El helper pasa `--env-file` también a las operaciones de estado y logs para que Compose pueda interpolar su descriptor. No copies los secretos al repositorio. Los proyectos con `.env` en su checkout conservan el comportamiento habitual.
