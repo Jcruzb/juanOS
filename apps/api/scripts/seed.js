@@ -77,8 +77,9 @@ async function seedApplication(input) {
       `INSERT INTO deployment_strategies (application_id, strategy, config)
        VALUES ($1,$2,$3::jsonb)
        ON CONFLICT (application_id) DO UPDATE SET
-         strategy = EXCLUDED.strategy, config = EXCLUDED.config, updated_at = now()`,
-      [applicationId, input.strategy, JSON.stringify({ serviceName: input.serviceName })]
+         strategy = EXCLUDED.strategy,
+         config = EXCLUDED.config || deployment_strategies.config, updated_at = now()`,
+      [applicationId, input.strategy, JSON.stringify({ serviceName: input.serviceName, ...(input.strategyConfig || {}) })]
     );
     await transaction.query(
       `INSERT INTO host_observability_authorizations (application_id, status)
@@ -127,7 +128,8 @@ if (process.env.JUANOS_PROJECT_PATH && process.env.JUANOS_REPOSITORY_URL) {
     repositoryUrl: process.env.JUANOS_REPOSITORY_URL,
     defaultBranch: process.env.JUANOS_DEFAULT_BRANCH || "main",
     deploymentType: "docker-compose",
-    serviceName: "juanos",
+    serviceName: "api",
+    strategyConfig: { composeFile: "docker-compose.yml", services: ["api", "web", "postgres"] },
     applicationType: "fullstack",
     strategy: "docker_compose",
     isJuanOS: true,

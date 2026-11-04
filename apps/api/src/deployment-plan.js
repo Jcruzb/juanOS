@@ -194,6 +194,7 @@ function appendStrategySteps(steps, application, operation) {
     steps.push(step("compose-up", "Crear o actualizar servicios Docker Compose", "docker_compose_up", {
       composeFile: config.composeFile || "compose.yml"
     }, true));
+    appendPublicationSteps(steps, application);
     return;
   }
   if (strategy === "docker") {
@@ -206,6 +207,7 @@ function appendStrategySteps(steps, application, operation) {
       imageName: config.imageName || application.slug,
       port: config.port || null
     }, true));
+    appendPublicationSteps(steps, application);
     return;
   }
 
@@ -265,6 +267,11 @@ function appendStrategySteps(steps, application, operation) {
     }, true));
   }
 
+  appendPublicationSteps(steps, application);
+}
+
+function appendPublicationSteps(steps, application) {
+  const config = application.strategyConfig || {};
   if (config.nginx?.enabled) {
     steps.push(step("nginx-configure", "Generar vhost Nginx desde política", "nginx_configure", {}, true));
     steps.push(step("nginx-reload", "Validar y recargar Nginx", "nginx_validate_reload", {}, true));
