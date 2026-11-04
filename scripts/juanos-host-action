@@ -110,11 +110,28 @@ function safeNameList(value, label) {
 }
 
 function command(executable, args, options = {}) {
+  const environment = { ...options.env };
+  if (executable === "docker") {
+    // The worker keeps /root read-only. Buildx needs writable client state.
+    // Keep it in a root-owned directory already allowed by the worker unit.
+    const parent = "/etc/juanos";
+    const parentStat = fs.lstatSync(parent);
+    if (!parentStat.isDirectory() || parentStat.isSymbolicLink() || parentStat.uid !== 0 || (parentStat.mode & 0o022)) {
+      throw new Error("Directorio de configuración Docker inseguro");
+    }
+    const directory = path.join(parent, "docker-client");
+    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const stat = fs.lstatSync(directory);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== 0 || (stat.mode & 0o077)) {
+      throw new Error("Estado de cliente Docker inseguro");
+    }
+    environment.DOCKER_CONFIG = directory;
+  }
   const child = spawn(executable, args, {
     cwd: options.cwd,
     env: {
       PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-      ...(options.env || {})
+      ...environment
     },
     stdio: options.capture ? ["ignore", "pipe", "pipe"] : "inherit",
     shell: false
