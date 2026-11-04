@@ -615,7 +615,7 @@ function DeploymentsView({ projects, initialProjectId = "", initialOperation = "
         <div className="plan-actions"><button disabled={cancelPlan.isPending || confirmPlan.isPending} onClick={() => cancelPlan.mutate()}>{cancelPlan.isPending ? "Cancelando…" : "Cancelar"}</button><button className="primary-button small" disabled={confirmPlan.isPending || cancelPlan.isPending} onClick={() => confirmPlan.mutate()}>{confirmPlan.isPending ? "Encolando…" : "Confirmar y ejecutar"}</button></div>
       </section>}
       {liveLog && <pre className="live-log">{liveLog}</pre>}
-      <div className="deployment-list">{(deployments.data?.deployments || []).map((item) => <article key={item.id}><span className={`deployment-status ${item.status}`} /><div><strong>{item.projectName}</strong><small>{item.operation} · {item.branch} · {(item.commitSha || "").slice(0, 8)}</small></div><b>{item.status}</b><time>{new Date(item.startedAt).toLocaleString()}</time></article>)}</div>
+      <div className="deployment-list">{(deployments.data?.deployments || []).map((item) => <article key={item.id}><span className={`deployment-status ${item.status}`} /><div><strong>{item.projectName}</strong><small>{item.operation} · {item.branch} · {(item.commitSha || "").slice(0, 8)}</small></div><b>{item.status}</b><time>{new Date(item.startedAt).toLocaleString()}</time>{item.status === "waiting_confirmation" && item.plan && <button onClick={() => { createPlan.reset(); setPendingPlan({ deploymentId: item.id, plan: item.plan, planHash: item.planHash }); }}>Revisar o cancelar</button>}</article>)}</div>
     </section>
   );
 }

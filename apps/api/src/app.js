@@ -73,6 +73,9 @@ export function createApp({ db, config }) {
         error: { code: "VALIDATION_ERROR", message: "Datos no válidos", details: error.issues }
       });
     }
+    if (error?.code === "23505" && error.constraint === "deployments_one_active_per_project_idx") {
+      return response.status(409).json({ error: { code: "DEPLOYMENT_ALREADY_ACTIVE", message: "Ya existe una operación pendiente o en ejecución. Revisa el historial y cancela el plan pendiente antes de crear otro." } });
+    }
     if (error?.code === "23505") {
       return response.status(409).json({ error: { code: "CONFLICT", message: "El recurso ya existe" } });
     }
