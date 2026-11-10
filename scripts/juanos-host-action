@@ -204,7 +204,27 @@ function nginxLocations(app) {
     proxy_read_timeout 1h;
     proxy_buffering off;
   }` : "";
-  return `${apiLocations}
+  const exactRoutes = (nginx.exactRoutes || []).map((route) => {
+    if (!/^\/[a-z0-9/_-]+$/.test(route.path || "") || route.path.includes("//")) {
+      fail("Ruta exacta Nginx no válida");
+    }
+    const upstream = safePort(route.upstreamPort);
+    const body = route.maxBodyMiB ?? 1;
+    const timeout = route.readTimeoutSeconds ?? 60;
+    if (!Number.isInteger(body) || body < 1 || body > 128 ||
+        !Number.isInteger(timeout) || timeout < 1 || timeout > 300) {
+      fail("Límites de ruta Nginx no válidos");
+    }
+    return `
+  location = ${route.path} {
+    proxy_pass http://127.0.0.1:${upstream};
+    proxy_set_header Authorization $http_authorization;
+    proxy_set_header Host $host;
+    client_max_body_size ${body}m;
+    proxy_read_timeout ${timeout}s;
+  }`;
+  }).join("\n");
+  return `${apiLocations}${exactRoutes}
   location / {
     proxy_pass http://127.0.0.1:${webPort};
     proxy_http_version 1.1;
