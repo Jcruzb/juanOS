@@ -22,3 +22,24 @@ for (const strategy of ["docker", "docker_compose"]) {
     assert.ok(!buildDeploymentPlan(application, "deploy").plan.steps.some(s => s.action === "nginx_configure"));
   });
 }
+
+for (const operation of ["update", "repair"]) {
+  test(`${operation} retains a running application's port instead of requiring it free`, () => {
+    const application = {
+      id: "00000000-0000-4000-8000-000000000001", slug: "juandb",
+      strategy: "docker_compose", defaultBranch: "main", applicationType: "fullstack",
+      repositoryExists: true, currentCommit: "a".repeat(40),
+      strategyConfig: { port: 8743, composeFile: "compose.yml", nginx: { enabled: true } },
+      healthCheck: { url: "https://juandb.example.com/health" }
+    };
+    const steps = buildDeploymentPlan(application, operation).plan.steps;
+    assert.ok(!steps.some(s => s.action === "port_check"));
+    assert.ok(steps.some(s => s.action === "docker_compose_up"));
+    assert.ok(steps.some(s => s.action === "nginx_configure"));
+    assert.equal(application.strategyConfig.port, 8743);
+    assert.ok(steps.some(s => s.action === "health_check"));
+    assert.ok(buildDeploymentPlan(application, "deploy").plan.steps.some(s => s.action === "port_check"));
+    application.repositoryExists = false;
+    assert.ok(buildDeploymentPlan(application, operation).plan.steps.some(s => s.action === "port_check"));
+  });
+}

@@ -115,7 +115,11 @@ export function buildDeploymentPlan(application, operation) {
       strategy: application.strategy,
       applicationType: application.applicationType
     }));
-    if (config.port) {
+    // An update reuses the application's listener. Requiring that port to be
+    // free rejects every healthy deployment before Compose can reconcile it.
+    // Initial deployments still check availability; runtime binding and the
+    // publication/health checks remain responsible for detecting conflicts.
+    if (config.port && (operation === "deploy" || application.repositoryExists === false)) {
       steps.push(step("port-check", `Comprobar puerto ${config.port}`, "port_check", {
         port: config.port
       }));
