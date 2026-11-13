@@ -87,7 +87,7 @@ now kills that PTY and ends its row instead of leaving an unreachable active ses
 
 ## Instalación de la corrección de terminales
 
-Versión instalada: `bbe5bad26e2c5f8c37d74c1e4eec55db01e98d55`. **Validación final E2E completada**. La API arrancó el2026-11-13 a las14:08:14.468776453Z; desde el panel se abrió una terminal backend a las14:08:37, se ejecutó una salida diferida con `sleep5` y `printf` y se navegó a configuración. Tras esperar más de20segundos, la sesión del propietario1 quedó finalizada automáticamente a las14:09:03. La API mantuvo su hora de arranque y contador de reinicios0, saludable.
+Versión instalada: `bbe5bad26e2c5f8c37d74c1e4eec55db01e98d55`. **Validación final E2E completada**. La API arrancó el 2026-11-13 a las 14:08:14.468776453Z; desde el panel se abrió una terminal backend a las 14:08:37, se ejecutó una salida diferida con `sleep 5` y `printf` y se navegó a configuración. Tras esperar más de 20 segundos, la sesión del propietario 1 quedó finalizada automáticamente a las 14:09:03. La API mantuvo su hora de arranque y contador de reinicios 0, saludable.
 
 JuanOS `/api/health` respondió correctamente, el worker y `controlants-gunicorn` siguen activos y ControlAnts `/login` respondió HTTP200. Se conservaron las configuraciones revisadas de frontend y backend. No se desplegaron las mejoras de ControlAnts ni se fusionó ninguna rama con main.
 
