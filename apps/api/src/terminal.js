@@ -144,7 +144,13 @@ export function attachTerminalServer(server, { db, config, ptyImpl = pty, runtim
         await db.query("UPDATE terminal_sessions SET status='ended',ended_at=now() WHERE id=$1", [session.id]);
         throw error;
       }
-      if (stopping || !runtime.active) { terminal.kill("SIGKILL"); websocket.close(1011, "terminal unavailable"); return; }
+      if (stopping || !runtime.active || websocket.readyState !== WebSocket.OPEN) {
+        try { terminal.kill("SIGKILL"); } catch { /* PTY already exited. */ }
+        await db.query("UPDATE terminal_sessions SET status='ended',ended_at=COALESCE(ended_at,now()) WHERE id=$1", [session.id]);
+        sessions.delete(session.id);
+        websocket.close(1011, "terminal unavailable");
+        return;
+      }
     } else if (session.disconnectTimer) {
       clearTimeout(session.disconnectTimer);
       session.disconnectTimer = null;
@@ -176,7 +182,9 @@ export function attachTerminalServer(server, { db, config, ptyImpl = pty, runtim
     websocket.on("close", () => {
       if (session.websocket !== websocket || session.ended || stopping) return;
       session.websocket = null;
-      session.disconnectTimer = setTimeout(() => session.terminal.kill("SIGHUP"), 20_000);
+      session.disconnectTimer = setTimeout(() => {
+        try { session.terminal.kill("SIGHUP"); } catch { /* PTY already exited. */ }
+      }, 20_000);
       session.disconnectTimer.unref();
     });
     })().catch((error) => {

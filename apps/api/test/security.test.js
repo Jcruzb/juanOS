@@ -304,3 +304,43 @@ test("un login incorrecto no se confunde con una sesión vencida", async () => {
     globalThis.fetch = originalFetch;
   }
 });
+
+
+test("disconnect while opening audit is pending closes PTY and its session row", { timeout: 5000 }, async () => {
+  let entered;
+  let release;
+  const auditEntered = new Promise(resolve => { entered = resolve; });
+  const auditPending = new Promise(resolve => { release = resolve; });
+  let killed;
+  const terminalKilled = new Promise(resolve => { killed = resolve; });
+  let closedRow = false;
+  const db = { query: async sql => {
+    if (sql.includes("FROM app_sessions")) return { rows: [{ user_id: "u", project_id: "p", local_path: "/tmp" }] };
+    if (sql.includes("INSERT INTO terminal_sessions")) return { rows: [{ id: "session-opening" }] };
+    if (sql.includes("INSERT INTO audit_logs")) { entered(); await auditPending; }
+    if (sql.includes("UPDATE terminal_sessions")) closedRow = true;
+    return { rows: [] };
+  } };
+  const server = http.createServer();
+  const wss = attachTerminalServer(server, {
+    db, config: { APP_ORIGIN: "http://localhost", NODE_ENV: "test" },
+    ptyImpl: { spawn: () => ({ onData() {}, onExit() {}, kill() { killed(); } }) },
+    runtimeFactory: async () => ({ ownerId: 1, active: true, stop: async () => {} })
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  const socket = new WebSocket(`ws://127.0.0.1:${server.address().port}/ws/terminal?projectId=p`, {
+    origin: "http://localhost", headers: { cookie: "juanos_session=test" }
+  });
+  await new Promise(resolve => socket.once("open", resolve));
+  await auditEntered;
+  const closed = new Promise(resolve => socket.once("close", resolve));
+  socket.close();
+  await closed;
+  release();
+  await terminalKilled;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(closedRow, true);
+  await wss.stopTerminals();
+  await new Promise(resolve => wss.close(resolve));
+  await new Promise(resolve => server.close(resolve));
+});

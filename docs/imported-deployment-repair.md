@@ -69,10 +69,13 @@ that its owning pre-upgrade API and PTY no longer exist. Scope updates to review
 session IDs with `status='active'` and a verified restart cutoff; preserve history,
 other projects and newer sessions. Age alone does not prove abandonment.
 
-Validation: full `npm test` completed with **65 passed, 1 skipped, 0 failed**;
+Validation: full `npm test` completed with **66 passed, 1 skipped, 0 failed**;
 API typecheck, changed-file ESLint and `git diff --check` passed. The skipped suite
 requires an explicit `JUANOS_TEST_DATABASE_URL` whose database name starts with
 `juanos_config_test_`. Its new PostgreSQL test verifies that live owners and legacy
 rows remain active while a disconnected owner's sessions are recovered. This new
 SQL test has **not yet run on PostgreSQL 17** and must pass in an isolated database
 before deploying this candidate. It creates and removes only its random test schema.
+
+Follow-up regression also disconnects while the opening audit is pending; the API
+now kills that PTY and ends its row instead of leaving an unreachable active session.
