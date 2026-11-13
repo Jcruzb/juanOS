@@ -11,6 +11,7 @@ export function createDatabase(connectionString) {
   });
 
   return {
+    connect() { return pool.connect(); },
     query(text, values) {
       return pool.query(text, values);
     },

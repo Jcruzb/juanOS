@@ -2,7 +2,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import dns from "node:dns/promises";
 import { spawn } from "node:child_process";
-import { assertSafeDeploymentPlan } from "./deployment-plan.js";
+import { deploymentPlanHash, assertSafeDeploymentPlan } from "./deployment-plan.js";
+import { validateDeploymentContext } from "./deployment-context.js";
 import { runGit } from "./git.js";
 import { redactSecrets } from "./security.js";
 import { validatePrivilegedHelper } from "./deploy-script.js";
@@ -41,22 +42,26 @@ function createPublisher(stream, handle) {
 async function claimDeployment(db, workerId) {
   return db.transaction(async (transaction) => {
     await transaction.query("DELETE FROM deployment_locks WHERE expires_at < now()");
+    const project = await transaction.query(`SELECT p.id FROM projects p
+      WHERE EXISTS (SELECT 1 FROM deployments d WHERE d.project_id = p.id AND d.status = 'queued')
+      AND NOT EXISTS (SELECT 1 FROM deployment_locks l WHERE l.application_id = p.id AND l.expires_at >= now())
+      ORDER BY p.id FOR UPDATE OF p SKIP LOCKED LIMIT 1`);
+    if (!project.rows[0]) return null;
     const selected = await transaction.query(
-      `SELECT d.id, d.project_id AS "applicationId", d.plan, d.operation,
+      `SELECT d.id, d.project_id AS "applicationId", d.plan, d.plan_hash AS "planHash", d.operation,
         p.slug, p.local_path AS "localPath", p.service_name AS "serviceName",
         p.deployment_type AS "legacyDeploymentType", p.is_juanos AS "isJuanOS"
        FROM deployments d JOIN projects p ON p.id = d.project_id
-       WHERE d.status = 'queued'
+       WHERE d.status = 'queued' AND d.project_id = $1
          AND NOT EXISTS (
            SELECT 1 FROM deployment_locks l
            WHERE l.application_id = d.project_id AND l.expires_at >= now()
          )
        ORDER BY d.started_at
-       FOR UPDATE OF d SKIP LOCKED LIMIT 1`
+       FOR UPDATE OF d SKIP LOCKED LIMIT 1`, [project.rows[0].id]
     );
     const deployment = selected.rows[0];
     if (!deployment) return null;
-    assertSafeDeploymentPlan(deployment.plan);
     await transaction.query(
       `INSERT INTO deployment_locks
         (application_id, deployment_id, owner, expires_at)
@@ -122,7 +127,7 @@ async function executeCommand(executable, args, options, publish) {
   });
 }
 
-async function executePlanStep({ db, config, deployment, step, publish }) {
+export async function executePlanStep({ db, config, deployment, step, publish }) {
   const cwd = deployment.localPath;
   const readOnlyActions = new Set([
     "preflight_system", "port_check", "git_status", "git_fetch", "git_compare",
@@ -220,6 +225,9 @@ async function executePlanStep({ db, config, deployment, step, publish }) {
       "clone", "--branch", step.input.branch, "--single-branch",
       step.input.repositoryUrl, cwd
     ], { cwd: path.dirname(cwd), shell: false }, publish);
+    const actual = (await runGit(cwd, ["rev-parse", "HEAD"])).stdout.trim();
+    if (actual !== deployment.plan.targetCommitSha) throw Object.assign(new Error("La rama remota cambió durante el clonado. Genera otro plan."), { code: "STALE_DEPLOYMENT_PLAN" });
+    deployment.codeUpdated = true;
     return;
   }
   if (step.action === "git_status") {
@@ -234,18 +242,21 @@ async function executePlanStep({ db, config, deployment, step, publish }) {
     return;
   }
   if (step.action === "git_fetch") {
-    const result = await runGit(cwd, ["fetch", "--prune", "origin"]);
+    const result = await runGit(cwd, ["fetch", "--no-tags", "origin", `refs/heads/${step.input.branch}`]);
+    const fetched = (await runGit(cwd, ["rev-parse", "FETCH_HEAD^{commit}"])).stdout.trim();
+    if (fetched !== deployment.plan.targetCommitSha) throw Object.assign(new Error("La rama remota cambió; genera otro plan."), { code: "STALE_DEPLOYMENT_PLAN" });
     await publish(result.stdout || "Referencias remotas actualizadas.\n");
     return;
   }
   if (step.action === "git_compare") {
-    const branch = step.input.branch;
-    const result = await runGit(cwd, ["rev-list", "--count", `HEAD..origin/${branch}`]);
+    const result = await runGit(cwd, ["rev-list", "--count", `HEAD..${deployment.plan.targetCommitSha}`]);
     await publish(`Commits remotos pendientes: ${result.stdout.trim() || "0"}\n`);
     return;
   }
-  if (step.action === "git_pull") {
-    const result = await runGit(cwd, ["pull", "--ff-only", "origin", step.input.branch]);
+  if (step.action === "git_fast_forward") {
+    await validateDeploymentContext(db, deployment.plan);
+    const result = await runGit(cwd, ["merge", "--ff-only", deployment.plan.targetCommitSha]);
+    deployment.codeUpdated = true;
     await publish(result.stdout || "Copia de trabajo actualizada.\n");
     return;
   }
@@ -271,6 +282,10 @@ async function executePlanStep({ db, config, deployment, step, publish }) {
     return;
   }
   if (step.action === "django_migrate" || step.action === "django_collectstatic") {
+    if (step.action === "django_migrate") {
+      const backup = await db.query("SELECT id FROM database_backups WHERE deployment_id = $1 AND application_id = $2 AND status = 'verified' AND path IS NOT NULL AND checksum IS NOT NULL AND size > 0", [deployment.id, deployment.applicationId]);
+      if (!backup.rows.length) throw Object.assign(new Error("No existe un backup verificado para esta migración."), { code: "DATABASE_BACKUP_REQUIRED" });
+    }
     const workingDirectory = await resolveWorkingDirectory(cwd, step.input.workingDirectory);
     const python = await resolveProjectExecutable(workingDirectory, step.input.venv, "python");
     const args = step.action === "django_migrate"
@@ -305,6 +320,7 @@ async function executePlanStep({ db, config, deployment, step, publish }) {
         run
       });
       const metadata = parseLastJsonLine(result.stdout);
+      if (!metadata?.path || !/^[a-f0-9]{64}$/i.test(metadata.checksum || "") || !(Number(metadata.size) > 0)) throw Object.assign(new Error("El backup no devolvió evidencia verificable."), { code: "DATABASE_BACKUP_UNVERIFIED" });
       await db.query(
         `UPDATE database_backups SET status = 'verified', path = $2, checksum = $3,
          size = $4, verified_at = now() WHERE id = $1`,
@@ -503,6 +519,7 @@ async function executePlanStep({ db, config, deployment, step, publish }) {
         publish
       );
       const metadata = parseLastJsonLine(result.stdout);
+      if (!metadata?.path || !/^[a-f0-9]{64}$/i.test(metadata.checksum || "") || !(Number(metadata.size) > 0)) throw Object.assign(new Error("El backup no devolvió evidencia verificable."), { code: "DATABASE_BACKUP_UNVERIFIED" });
       await db.query(
         `UPDATE recovery_snapshots SET status = 'available', remote_provider = $2,
          remote_path = $3, local_path = $4, checksum = $5, size = $6,
@@ -544,6 +561,7 @@ async function executePlanStep({ db, config, deployment, step, publish }) {
         publish
       );
       const metadata = parseLastJsonLine(result.stdout);
+      if (!metadata?.path || !/^[a-f0-9]{64}$/i.test(metadata.checksum || "") || !(Number(metadata.size) > 0)) throw Object.assign(new Error("El backup no devolvió evidencia verificable."), { code: "DATABASE_BACKUP_UNVERIFIED" });
       await db.query(
         `UPDATE recovery_snapshots SET status = 'verified', verification_status = 'valid',
          verified_at = $2, verification_error = NULL, manifest = $3::jsonb WHERE id = $1`,
@@ -642,12 +660,27 @@ async function resolveProjectDirectory(root, relativePath) {
   return target;
 }
 
-async function resolveProjectExecutable(workingDirectory, venv, name) {
+export async function resolveProjectExecutable(workingDirectory, venv, name) {
   const venvDirectory = await resolveProjectDirectory(workingDirectory, venv);
-  const executable = await resolveProjectFile(venvDirectory, `bin/${name}`);
-  const stat = await fs.stat(executable);
-  if ((stat.mode & 0o111) === 0) throw new Error(`El ejecutable ${name} no tiene permisos de ejecución`);
-  return executable;
+  const binDirectory = await resolveProjectDirectory(venvDirectory, "bin");
+  const invocationPath = path.join(binDirectory, name);
+  const target = await fs.realpath(invocationPath);
+  const stat = await fs.stat(target);
+  const contained = target.startsWith(`${venvDirectory}${path.sep}`);
+  if (!contained) {
+    const systemPython = name === "python"
+      && ["/usr/bin", "/usr/local/bin"].includes(path.dirname(target))
+      && /^python3(?:\.\d+)?$/.test(path.basename(target))
+      && stat.uid === 0 && (stat.mode & 0o022) === 0;
+    if (!systemPython) throw new Error("Archivo fuera de la aplicación");
+    const directoryStat = await fs.stat(path.dirname(target));
+    if (directoryStat.uid !== 0 || (directoryStat.mode & 0o022) !== 0) {
+      throw new Error("El directorio del intérprete Python no es seguro");
+    }
+  }
+  if (!stat.isFile() || (stat.mode & 0o111) === 0) throw new Error(`El ejecutable ${name} no tiene permisos de ejecución`);
+  // Preserve the venv invocation path so Python discovers pyvenv.cfg and its installed packages.
+  return invocationPath;
 }
 
 async function detectPackageManager(workingDirectory, configured) {
@@ -741,6 +774,9 @@ export async function runDeploymentWorkerOnce({ db, config, workerId }) {
   let finalError = null;
   try {
     await db.query("UPDATE deployments SET log_path = $2 WHERE id = $1", [deployment.id, logPath]);
+    assertSafeDeploymentPlan(deployment.plan);
+    if (deploymentPlanHash(deployment.plan) !== deployment.planHash) throw Object.assign(new Error("El plan almacenado cambió; genera otro plan."), { code: "STALE_DEPLOYMENT_PLAN" });
+    await validateDeploymentContext(db, deployment.plan, { refreshTarget: ["deploy", "update", "repair"].includes(deployment.operation) });
     for (let position = 0; position < deployment.plan.steps.length; position += 1) {
       const planStep = deployment.plan.steps[position];
       await db.query(
@@ -750,6 +786,7 @@ export async function runDeploymentWorkerOnce({ db, config, workerId }) {
       );
       await publish(`\n[${position + 1}/${deployment.plan.steps.length}] ${planStep.name}\n`);
       try {
+        await validateDeploymentContext(db, deployment.plan, { codeUpdated: Boolean(deployment.codeUpdated) });
         await executePlanStep({ db, config, deployment, step: planStep, publish });
         await db.query(
           `UPDATE deployment_steps SET status = 'succeeded', finished_at = now(), exit_code = 0
@@ -770,6 +807,7 @@ export async function runDeploymentWorkerOnce({ db, config, workerId }) {
       }
     }
   } catch (error) {
+    if (!finalError) { finalError = error; finalStatus = "failed"; }
     await publish(`\nError: ${error.message}\n`);
   } finally {
     clearInterval(heartbeat);
@@ -777,6 +815,7 @@ export async function runDeploymentWorkerOnce({ db, config, workerId }) {
     await publish.flush();
     await handle.close();
     await db.transaction(async (transaction) => {
+      await transaction.query("SELECT id FROM projects WHERE id = $1 FOR UPDATE", [deployment.applicationId]);
       await transaction.query(
         `UPDATE deployments SET status = $2, finished_at = now(),
          error_code = $3, error_message = $4, output_summary = $5

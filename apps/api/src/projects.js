@@ -1,4 +1,4 @@
-import { idSchema, projectSchema } from "@juanos/shared";
+import { idSchema, projectSchema, projectConfigurationPatchSchema, strategyConfigSchema, strategyConfigurationKeys } from "@juanos/shared";
 import { assertProjectPath } from "./security.js";
 import { writeAudit } from "./audit.js";
 import { requireCsrf } from "./auth.js";
@@ -17,6 +17,9 @@ const selectProject = `SELECT p.id, p.name, p.slug, p.local_path AS "localPath",
   p.last_deployed_at AS "lastDeployedAt", p.is_active AS "isActive",
   p.created_at AS "createdAt", p.updated_at AS "updatedAt",
   ds.strategy, ds.config AS "strategyConfig",
+  CASE WHEN hc.id IS NULL THEN NULL ELSE json_strip_nulls(json_build_object(
+    'url',hc.url,'expectedStatus',hc.expected_status,'timeoutMs',hc.timeout_ms,
+    'retries',hc.retries,'responseMatch',hc.response_match)) END AS "healthCheck",
   r.current_branch AS "storedCurrentBranch",
   r.deployed_commit_sha AS "deployedCommitSha",
   r.last_remote_commit_sha AS "lastRemoteCommitSha",
@@ -29,6 +32,9 @@ const selectProject = `SELECT p.id, p.name, p.slug, p.local_path AS "localPath",
   FROM projects p
   LEFT JOIN deployment_strategies ds ON ds.application_id = p.id
   LEFT JOIN repositories r ON r.application_id = p.id
+  LEFT JOIN LATERAL (
+    SELECT * FROM health_checks WHERE application_id = p.id ORDER BY created_at, id LIMIT 1
+  ) hc ON true
   LEFT JOIN LATERAL (
     SELECT * FROM certificates WHERE application_id = p.id ORDER BY expires_at LIMIT 1
   ) c ON true
@@ -152,8 +158,158 @@ export async function archiveProjectRegistration(db, applicationId) {
   });
 }
 
+const provenanceKeys = ["importedFrom", "legacy", "indicators", "services"];
+
+function configurationError(message, code, status = 409) {
+  return Object.assign(new Error(message), { status, code });
+}
+
+export async function updateProjectConfiguration(db, applicationId, payload, request) {
+  const input = projectConfigurationPatchSchema.parse(payload);
+  return db.transaction(async (transaction) => {
+    // Lock order is shared with deployment planning/confirmation: project, then deployments.
+    const selected = await transaction.query(
+      `SELECT p.id, p.slug, p.local_path AS "localPath", p.default_branch AS "defaultBranch",
+       p.application_type AS "applicationType", p.service_name AS "serviceName",
+       p.updated_at AS "updatedAt", ds.strategy, ds.config AS "strategyConfig"
+       FROM projects p LEFT JOIN deployment_strategies ds ON ds.application_id = p.id
+       WHERE p.id = $1 AND p.is_active = true FOR UPDATE OF p`,
+      [applicationId]
+    );
+    const current = selected.rows[0];
+    if (!current) throw configurationError("Aplicación no encontrada", "NOT_FOUND", 404);
+    if (new Date(current.updatedAt).getTime() !== new Date(input.expectedUpdatedAt).getTime()) {
+      throw configurationError("La configuración cambió; recarga y revisa antes de guardar", "CONFIGURATION_CHANGED");
+    }
+    const deployments = await transaction.query(
+      `SELECT id, status FROM deployments WHERE project_id = $1
+       AND status IN ('pending','analyzing','waiting_confirmation','waiting_sudo','queued','running')
+       ORDER BY id FOR UPDATE`,
+      [applicationId]
+    );
+    const operations = await transaction.query(
+      `SELECT EXISTS (SELECT 1 FROM deployment_locks WHERE application_id = $1 AND expires_at > now())
+       OR EXISTS (SELECT 1 FROM operational_log_sessions WHERE application_id = $1 AND status IN ('queued','running'))
+       OR EXISTS (SELECT 1 FROM terminal_sessions WHERE project_id = $1 AND status = 'active') AS active`,
+      [applicationId]
+    );
+    if (deployments.rows.some((row) => row.status !== "waiting_confirmation") || operations.rows[0]?.active) {
+      throw configurationError("Cierra las operaciones activas antes de modificar la configuración", "APPLICATION_BUSY");
+    }
+    const oldConfig = current.strategyConfig || {};
+    const requiredReviewFields = ["defaultBranch", "applicationType", "strategy", "serviceName", "strategyConfig"];
+    if ((oldConfig.importedFrom || oldConfig.legacy) && !oldConfig.configurationReviewedAt &&
+        requiredReviewFields.some((key) => !Object.hasOwn(input, key))) {
+      throw configurationError("Revisa explícitamente toda la configuración de la aplicación importada", "CONFIGURATION_REVIEW_REQUIRED");
+    }
+    const values = {
+      defaultBranch: input.defaultBranch ?? current.defaultBranch,
+      applicationType: input.applicationType ?? current.applicationType,
+      strategy: input.strategy ?? current.strategy,
+      serviceName: input.serviceName ?? current.serviceName
+    };
+    if (!values.strategy) {
+      throw configurationError("Selecciona una estrategia explícita", "CONFIGURATION_REVIEW_REQUIRED");
+    }
+    const previousOperational = Object.fromEntries(strategyConfigurationKeys
+      .filter((key) => Object.hasOwn(oldConfig, key)).map((key) => [key, oldConfig[key]]));
+    const operational = strategyConfigSchema.parse(input.strategyConfig ?? previousOperational);
+    if (values.strategy === "systemd" && operational.serviceName && operational.serviceName !== values.serviceName) {
+      throw configurationError("El servicio de la estrategia debe coincidir con el servicio seleccionado", "SERVICE_NAME_MISMATCH", 400);
+    }
+    const provenance = Object.fromEntries(provenanceKeys.filter((key) => Object.hasOwn(oldConfig, key))
+      .map((key) => [key, oldConfig[key]]));
+    const strategyConfig = { ...provenance, ...operational, configurationReviewedAt: new Date().toISOString() };
+    const waiting = deployments.rows.filter((row) => row.status === "waiting_confirmation").map((row) => row.id);
+    if (waiting.length) {
+      await transaction.query(
+        `UPDATE deployments SET status = 'cancelled', finished_at = now(),
+         error_code = 'CONFIGURATION_CHANGED', error_message = 'La configuración cambió; crea y revisa un plan nuevo'
+         WHERE id = ANY($1::uuid[]) AND status = 'waiting_confirmation'`, [waiting]
+      );
+      await transaction.query(
+        `UPDATE deployment_steps SET status = 'cancelled', finished_at = now()
+         WHERE deployment_id = ANY($1::uuid[]) AND status = 'pending'`, [waiting]
+      );
+    }
+    const updated = await transaction.query(
+      `UPDATE projects SET default_branch = $2, application_type = $3, service_name = $4,
+       deployment_type = $5, expected_state = expected_state || $6::jsonb,
+       updated_at = GREATEST(clock_timestamp(), updated_at + interval '1 millisecond')
+       WHERE id = $1 RETURNING updated_at AS "updatedAt"`,
+      [applicationId, values.defaultBranch, values.applicationType, values.serviceName,
+        values.strategy === "docker_compose" ? "docker-compose" : "systemd",
+        JSON.stringify({ branch: values.defaultBranch, strategy: values.strategy })]
+    );
+    await transaction.query(
+      `UPDATE repositories SET default_branch = $2, updated_at = now() WHERE application_id = $1`,
+      [applicationId, values.defaultBranch]
+    );
+    await transaction.query(
+      `INSERT INTO deployment_strategies (application_id, strategy, config) VALUES ($1,$2,$3::jsonb)
+       ON CONFLICT (application_id) DO UPDATE SET strategy = EXCLUDED.strategy,
+       config = EXCLUDED.config, updated_at = now()`,
+      [applicationId, values.strategy, JSON.stringify(strategyConfig)]
+    );
+    // Host policy, service registrations, files, observed state and secrets are not adopted or modified.
+    const healthResult = await transaction.query(
+      `SELECT id, url, expected_status AS "expectedStatus", timeout_ms AS "timeoutMs", retries,
+       response_match AS "responseMatch" FROM health_checks WHERE application_id = $1
+       ORDER BY created_at, id LIMIT 1 FOR UPDATE`, [applicationId]
+    );
+    let healthCheck = healthResult.rows[0] || null;
+    if (input.healthCheck) {
+      const health = input.healthCheck;
+      if (healthCheck) {
+        await transaction.query(
+          `UPDATE health_checks SET url=$2, expected_status=$3, timeout_ms=$4, retries=$5,
+           response_match=$6, last_status='not_checked', last_checked_at=NULL, last_error=NULL, updated_at=now()
+           WHERE id=$1`,
+          [healthCheck.id, health.url, health.expectedStatus, health.timeoutMs, health.retries, health.responseMatch || null]
+        );
+      } else {
+        const created = await transaction.query(
+          `INSERT INTO health_checks (application_id,url,expected_status,timeout_ms,retries,response_match)
+           VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+          [applicationId, health.url, health.expectedStatus, health.timeoutMs, health.retries, health.responseMatch || null]
+        );
+        healthCheck = { id: created.rows[0].id };
+      }
+      healthCheck = { id: healthCheck.id, ...health };
+    }
+    await writeAudit(transaction, request, {
+      action: "application.configuration_updated", resourceType: "application", resourceId: applicationId,
+      metadata: {
+        previous: { defaultBranch: current.defaultBranch, applicationType: current.applicationType,
+          strategy: current.strategy, serviceName: current.serviceName, strategyConfig: previousOperational },
+        next: { ...values, strategyConfig: operational, ...(input.healthCheck ? { healthCheck: input.healthCheck } : {}) },
+        invalidatedPlanIds: waiting, hostPolicyUnchanged: true
+      }
+    });
+    return {
+      application: { id: applicationId, ...values, strategyConfig, healthCheck: healthCheck ? Object.fromEntries(
+        ["url", "expectedStatus", "timeoutMs", "retries", "responseMatch"]
+          .filter((key) => healthCheck[key] !== undefined && healthCheck[key] !== null)
+          .map((key) => [key, healthCheck[key]])
+      ) : null, updatedAt: updated.rows[0].updatedAt },
+      invalidatedPlans: waiting.length, hostPolicyUnchanged: true
+    };
+  });
+}
+
 export function createProjectsRouter({ express, db, config }) {
   const router = express.Router();
+
+  router.patch("/:projectId/configuration", requireCsrf, async (request, response, next) => {
+    try {
+      if (request.user?.role !== "admin") {
+        throw configurationError("Solo administradores pueden modificar la configuración", "FORBIDDEN", 403);
+      }
+      const applicationId = idSchema.parse(request.params.projectId);
+      const result = await updateProjectConfiguration(db, applicationId, request.body, request);
+      response.json(result);
+    } catch (error) { next(error); }
+  });
 
   router.get("/", async (_request, response, next) => {
     try {

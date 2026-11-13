@@ -80,7 +80,7 @@ test("la terminal usa cwd del servidor y exige el origen exacto", () => {
   assert.equal(isAllowedWsOrigin("https://evil.example", "https://os.example.com"), false);
 });
 
-test("WebSocket autenticado crea una PTY y transmite salida", async () => {
+for (const shutdown of [false, true]) test(`WebSocket autenticado transmite salida y cierra PTY: ${shutdown ? "apagado API" : "salida shell"}`, async () => {
   const project = await fs.mkdtemp(path.join(os.tmpdir(), "juanos-terminal-"));
   const sessionId = "00000000-0000-4000-8000-000000000010";
   const db = {
@@ -106,7 +106,7 @@ test("WebSocket autenticado crea una PTY y transmite salida", async () => {
   };
   const ptyImpl = { spawn: () => terminal };
   const server = http.createServer();
-  const wss = attachTerminalServer(server, { db, config: { APP_ORIGIN: "http://localhost", NODE_ENV: "test" }, ptyImpl });
+  const wss = attachTerminalServer(server, { db, config: { APP_ORIGIN: "http://localhost", NODE_ENV: "test" }, ptyImpl, runtimeFactory: async () => ({ ownerId: 1, active: true, stop: async () => {} }) });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const { port } = server.address();
   const socket = new WebSocket(`ws://127.0.0.1:${port}/ws/terminal?projectId=project-1`, {
@@ -127,7 +127,8 @@ test("WebSocket autenticado crea una PTY y transmite salida", async () => {
         if (received.includes("JUANOS_PTY_OK")) {
           clearTimeout(timeout);
           resolve(received);
-          socket.send(JSON.stringify({ type: "input", data: "exit\r" }));
+          if (shutdown) void wss.stopTerminals();
+          else socket.send(JSON.stringify({ type: "input", data: "exit\r" }));
         }
       }
     });
@@ -135,6 +136,69 @@ test("WebSocket autenticado crea una PTY y transmite salida", async () => {
   });
   assert.match(output, /JUANOS_PTY_OK/);
   await new Promise((resolve) => socket.once("close", resolve));
+  await new Promise((resolve) => wss.close(resolve));
+  await new Promise((resolve) => server.close(resolve));
+  await fs.rm(project, { recursive: true, force: true });
+});
+
+test("PTY output after WebSocket disconnect never crashes API and remains resumable", async () => {
+  const project = await fs.mkdtemp(path.join(os.tmpdir(), "juanos-terminal-"));
+  const sessionId = "00000000-0000-4000-8000-000000000010";
+  const db = {
+    async query(sql) {
+      if (sql.includes("FROM app_sessions")) {
+        return { rows: [{ user_id: "user-1", email: "admin@example.com", role: "admin", project_id: "project-1", local_path: project }] };
+      }
+      if (sql.includes("INSERT INTO terminal_sessions")) return { rows: [{ id: sessionId }] };
+      return { rows: [], rowCount: 1 };
+    }
+  };
+  let onData = () => {};
+  let onExit = () => {};
+  const terminal = {
+    onData(callback) { onData = callback; },
+    onExit(callback) { onExit = callback; },
+    write(data) {
+      if (data.includes("printf")) setImmediate(() => onData("JUANOS_PTY_OK\n"));
+      if (data.includes("exit")) setImmediate(() => onExit({ exitCode: 0, signal: 0 }));
+    },
+    resize() {},
+    kill() { setImmediate(() => onExit({ exitCode: 0, signal: 1 })); }
+  };
+  const ptyImpl = { spawn: () => terminal };
+  const server = http.createServer();
+  const wss = attachTerminalServer(server, { db, config: { APP_ORIGIN: "http://localhost", NODE_ENV: "test" }, ptyImpl, runtimeFactory: async () => ({ ownerId: 1, active: true, stop: async () => {} }) });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address();
+  const socket = new WebSocket(`ws://127.0.0.1:${port}/ws/terminal?projectId=project-1`, {
+    origin: "http://localhost",
+    headers: { cookie: "juanos_session=test-token" }
+  });
+  const output = await new Promise((resolve, reject) => {
+    let received = "";
+    const timeout = setTimeout(() => reject(new Error("La PTY no devolvió salida")), 5000);
+    socket.on("message", (raw) => {
+      const message = JSON.parse(raw.toString());
+      if (message.type === "ready") {
+        assert.equal(message.terminalSessionId, sessionId);
+        socket.send(JSON.stringify({ type: "input", data: "printf 'JUANOS_PTY_OK\\n'\r" }));
+      }
+      if (message.type === "output") {
+        received += message.data;
+        if (received.includes("JUANOS_PTY_OK")) {
+          clearTimeout(timeout);
+          resolve(received);
+          socket.close();
+        }
+      }
+    });
+    socket.on("error", reject);
+  });
+  assert.match(output, /JUANOS_PTY_OK/);
+  await new Promise((resolve) => socket.once("close", resolve));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.doesNotThrow(() => onData("background output after disconnect\n"));
+  await wss.stopTerminals();
   await new Promise((resolve) => wss.close(resolve));
   await new Promise((resolve) => server.close(resolve));
   await fs.rm(project, { recursive: true, force: true });
@@ -239,4 +303,44 @@ test("un login incorrecto no se confunde con una sesión vencida", async () => {
     unsubscribe();
     globalThis.fetch = originalFetch;
   }
+});
+
+
+test("disconnect while opening audit is pending closes PTY and its session row", { timeout: 5000 }, async () => {
+  let entered;
+  let release;
+  const auditEntered = new Promise(resolve => { entered = resolve; });
+  const auditPending = new Promise(resolve => { release = resolve; });
+  let killed;
+  const terminalKilled = new Promise(resolve => { killed = resolve; });
+  let closedRow = false;
+  const db = { query: async sql => {
+    if (sql.includes("FROM app_sessions")) return { rows: [{ user_id: "u", project_id: "p", local_path: "/tmp" }] };
+    if (sql.includes("INSERT INTO terminal_sessions")) return { rows: [{ id: "session-opening" }] };
+    if (sql.includes("INSERT INTO audit_logs")) { entered(); await auditPending; }
+    if (sql.includes("UPDATE terminal_sessions")) closedRow = true;
+    return { rows: [] };
+  } };
+  const server = http.createServer();
+  const wss = attachTerminalServer(server, {
+    db, config: { APP_ORIGIN: "http://localhost", NODE_ENV: "test" },
+    ptyImpl: { spawn: () => ({ onData() {}, onExit() {}, kill() { killed(); } }) },
+    runtimeFactory: async () => ({ ownerId: 1, active: true, stop: async () => {} })
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  const socket = new WebSocket(`ws://127.0.0.1:${server.address().port}/ws/terminal?projectId=p`, {
+    origin: "http://localhost", headers: { cookie: "juanos_session=test" }
+  });
+  await new Promise(resolve => socket.once("open", resolve));
+  await auditEntered;
+  const closed = new Promise(resolve => socket.once("close", resolve));
+  socket.close();
+  await closed;
+  release();
+  await terminalKilled;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(closedRow, true);
+  await wss.stopTerminals();
+  await new Promise(resolve => wss.close(resolve));
+  await new Promise(resolve => server.close(resolve));
 });

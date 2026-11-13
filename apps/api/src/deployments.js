@@ -1,10 +1,8 @@
-import fs from "node:fs/promises";
-import path from "node:path";
 import { z } from "zod";
 import { idSchema } from "@juanos/shared";
 import { requireCsrf } from "./auth.js";
 import { buildDeploymentPlan } from "./deployment-plan.js";
-import { runGit } from "./git.js";
+import { applicationForPlan, confirmDeployment } from "./deployment-context.js";
 import { writeAudit } from "./audit.js";
 export { deploymentStreams } from "./deployment-worker.js";
 export { validateDeployScript } from "./deploy-script.js";
@@ -17,72 +15,6 @@ const operationSchema = z.object({
 });
 const confirmSchema = z.object({ planHash: z.string().length(64) });
 
-async function applicationForPlan(db, id) {
-  const result = await db.query(
-    `SELECT p.id, p.slug, p.name, p.local_path AS "localPath",
-      p.default_branch AS "defaultBranch", p.is_juanos AS "isJuanOS",
-      p.application_type AS "applicationType", p.service_name AS "serviceName",
-      p.repository_url AS "repositoryUrl",
-      ds.strategy, ds.config AS "strategyConfig",
-      hc.id AS "healthId", hc.url AS "healthUrl", hc.expected_status AS "healthExpectedStatus",
-      hc.timeout_ms AS "healthTimeoutMs", hc.retries AS "healthRetries",
-      hc.response_match AS "healthResponseMatch",
-      ad.hostname AS domain,
-      rs.id AS "recoverySnapshotId", rs.remote_path AS "recoveryRemotePath",
-      rs.checksum AS "recoveryChecksum"
-     FROM projects p
-     JOIN deployment_strategies ds ON ds.application_id = p.id
-     LEFT JOIN LATERAL (
-       SELECT * FROM health_checks WHERE application_id = p.id ORDER BY created_at LIMIT 1
-     ) hc ON true
-     LEFT JOIN LATERAL (
-       SELECT hostname FROM application_domains WHERE application_id = p.id
-       ORDER BY is_primary DESC, created_at LIMIT 1
-     ) ad ON true
-     LEFT JOIN LATERAL (
-       SELECT id, remote_path, checksum FROM recovery_snapshots
-       WHERE status IN ('available', 'verified')
-       ORDER BY created_at DESC LIMIT 1
-     ) rs ON true
-     WHERE p.id = $1 AND p.is_active = true`,
-    [id]
-  );
-  if (!result.rows[0]) throw Object.assign(new Error("Aplicación no encontrada o sin estrategia"), { status: 404 });
-  const row = result.rows[0];
-  const repositoryExists = await fs.stat(path.join(row.localPath, ".git"))
-    .then((stat) => stat.isDirectory(), () => false);
-  let currentCommit = null;
-  if (repositoryExists) {
-    const commit = await runGit(row.localPath, ["rev-parse", "HEAD"]);
-    const status = await runGit(row.localPath, ["status", "--porcelain=v1"]);
-    if (status.stdout.trim()) {
-      throw Object.assign(new Error("Hay cambios locales; revísalos antes de crear el plan"), {
-        status: 409,
-        code: "LOCAL_CHANGES",
-        details: status.stdout.split("\n").filter(Boolean).slice(0, 100)
-      });
-    }
-    currentCommit = commit.stdout.trim();
-  }
-  return {
-    ...row,
-    currentCommit,
-    repositoryExists,
-    healthCheck: row.healthUrl ? {
-      id: row.healthId,
-      url: row.healthUrl,
-      expectedStatus: row.healthExpectedStatus,
-      timeoutMs: row.healthTimeoutMs,
-      retries: row.healthRetries,
-      responseMatch: row.healthResponseMatch
-    } : null,
-    recoverySnapshot: row.recoverySnapshotId ? {
-      id: row.recoverySnapshotId,
-      remotePath: row.recoveryRemotePath,
-      checksum: row.recoveryChecksum
-    } : null
-  };
-}
 
 export function createDeploymentsRouter({ express, db }) {
   const router = express.Router();
@@ -119,9 +51,11 @@ export function createDeploymentsRouter({ express, db }) {
   router.post("/plans", requireCsrf, async (request, response, next) => {
     try {
       const input = operationSchema.parse(request.body);
-      const application = await applicationForPlan(db, input.applicationId);
-      const { plan, hash } = buildDeploymentPlan(application, input.operation);
+      let application, plan, hash;
       const created = await db.transaction(async (transaction) => {
+        await transaction.query("SELECT id FROM projects WHERE id = $1 FOR UPDATE", [input.applicationId]);
+        application = await applicationForPlan(transaction, input.applicationId, { operation: input.operation, refreshTarget: ["deploy", "update", "repair"].includes(input.operation) });
+        ({ plan, hash } = buildDeploymentPlan(application, input.operation));
         const deployment = await transaction.query(
           `INSERT INTO deployments
             (project_id, user_id, branch, commit_sha, status, environment_id,
@@ -129,7 +63,7 @@ export function createDeploymentsRouter({ express, db }) {
            VALUES (
              $1,$2,$3,$4,'waiting_confirmation',
              (SELECT id FROM environments WHERE application_id = $1 AND is_default = true LIMIT 1),
-             $5,$4,NULL,$6,$7::jsonb,$8
+             $5,$4,$9,$6,$7::jsonb,$8
            ) RETURNING id`,
           [
             application.id,
@@ -139,7 +73,8 @@ export function createDeploymentsRouter({ express, db }) {
             input.operation,
             request.user.email,
             JSON.stringify(plan),
-            hash
+            hash,
+            plan.targetCommitSha
           ]
         );
         for (let position = 0; position < plan.steps.length; position += 1) {
@@ -165,7 +100,7 @@ export function createDeploymentsRouter({ express, db }) {
         action: "deployment.plan_created",
         resourceType: "deployment",
         resourceId: created,
-        metadata: { applicationId: application.id, operation: input.operation, planHash: hash }
+        metadata: { applicationId: input.applicationId, operation: input.operation, planHash: hash }
       });
       response.status(201).json({ deploymentId: created, plan, planHash: hash });
     } catch (error) { next(error); }
@@ -175,24 +110,12 @@ export function createDeploymentsRouter({ express, db }) {
     try {
       const deploymentId = idSchema.parse(request.params.deploymentId);
       const input = confirmSchema.parse(request.body);
-      const result = await db.query(
-        `UPDATE deployments SET status = 'queued', confirmed_at = now()
-         WHERE id = $1 AND plan_hash = $2 AND status = 'waiting_confirmation'
-          AND EXISTS (
-            SELECT 1 FROM projects p
-            WHERE p.id = deployments.project_id AND p.is_active = true
-          )
-         RETURNING project_id`,
-        [deploymentId, input.planHash]
-      );
-      if (!result.rows[0]) {
-        throw Object.assign(new Error("El plan cambió, ya fue confirmado o no existe"), { status: 409 });
-      }
+      const applicationId = await confirmDeployment(db, deploymentId, input.planHash);
       await writeAudit(db, request, {
         action: "deployment.plan_confirmed",
         resourceType: "deployment",
         resourceId: deploymentId,
-        metadata: { applicationId: result.rows[0].project_id, planHash: input.planHash }
+        metadata: { applicationId, planHash: input.planHash }
       });
       response.status(202).json({ deploymentId, status: "queued" });
     } catch (error) { next(error); }

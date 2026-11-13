@@ -3,6 +3,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { pathToFileURL } from "node:url";
 
 const POLICY_PATH = "/etc/juanos/host-policy.json";
 const SAFE_NAME = /^[A-Za-z0-9][A-Za-z0-9_.@-]{0,127}$/;
@@ -300,6 +301,39 @@ ${tlsServer}`;
   return available;
 }
 
+// Compare directory identities as imported projects may use host bind mounts.
+export async function assertSystemdDeploymentTarget(app, run = command) {
+  const service = app.systemd?.service;
+  if (!service || !SAFE_NAME.test(service)) throw new Error("Servicio systemd no configurado");
+  const relative = app.systemd?.workingDirectory || ".";
+  const expected = safeRelativeFile(fs.realpathSync(app.projectPath), relative, "Directorio systemd");
+  const result = await run("systemctl", ["show", "--property=WorkingDirectory", "--value", service], { capture: true });
+  const actual = result.stdout.trim();
+  if (!actual || !path.isAbsolute(actual)) throw new Error("El servicio no declara un directorio de trabajo absoluto");
+  const expectedStat = fs.statSync(expected);
+  const actualStat = fs.statSync(actual);
+  if (!actualStat.isDirectory() || expectedStat.dev !== actualStat.dev || expectedStat.ino !== actualStat.ino) {
+    throw new Error("El servicio systemd usa otro directorio; concilia la configuración antes de desplegar");
+  }
+}
+
+export function assertStaticDeploymentTarget(app) {
+  if (!app.static?.releaseRoot || !app.static?.currentSymlink) {
+    throw new Error("Configura las rutas de releases y publicación estática en la política del host");
+  }
+  const releaseRoot = realDirectory(app.static?.releaseRoot, "releaseRoot");
+  const current = app.static?.currentSymlink;
+  if (!path.isAbsolute(current || "") || !current.startsWith(`${path.dirname(releaseRoot)}${path.sep}`)) {
+    throw new Error("Symlink current no autorizado");
+  }
+  let stat;
+  try { stat = fs.lstatSync(current); } catch (error) { if (error.code !== "ENOENT") throw error; }
+  if (stat && !stat.isSymbolicLink()) {
+    throw new Error("El destino estático es un directorio existente; prepara su migración a releases sin sobrescribirlo");
+  }
+  return { releaseRoot, current };
+}
+
 async function runAction(action, values, app) {
   const projectPath = realDirectory(app.projectPath, "projectPath");
   app.projectPath = projectPath;
@@ -315,6 +349,8 @@ async function runAction(action, values, app) {
     if (strategy === "docker" || strategy === "docker_compose") tools.add("docker");
     if (app.nginx) tools.add("nginx");
     for (const tool of tools) await command("/usr/bin/env", ["which", tool]);
+    if (strategy === "systemd") await assertSystemdDeploymentTarget(app);
+    if (strategy === "static_nginx") assertStaticDeploymentTarget(app);
     return;
   }
   if (action === "port-check") {
@@ -333,6 +369,7 @@ async function runAction(action, values, app) {
   }
   if (action === "systemd-restart") {
     const service = safeConfiguredName(values.service, app.systemd?.service, "Servicio systemd");
+    await assertSystemdDeploymentTarget(app);
     await command("systemctl", ["restart", service]);
     await command("systemctl", ["is-active", service]);
     return;
@@ -471,6 +508,7 @@ async function runAction(action, values, app) {
     return;
   }
   if (action === "publish-static") {
+    assertStaticDeploymentTarget(app);
     const source = safeRelativeFile(projectPath, values.source, "Artefacto estático");
     const sourceStat = fs.statSync(source);
     if (!sourceStat.isDirectory()) fail("El artefacto estático no es un directorio");
@@ -509,7 +547,17 @@ async function runAction(action, values, app) {
     const backup = app.databaseBackup;
     if (!backup || values.strategy !== backup.strategy) fail("Backup no autorizado por la política");
     const backupRoot = realDirectory(backup.outputDirectory, "Directorio de backups");
+    const directoryStat = fs.statSync(backupRoot);
+    if (directoryStat.uid !== 0 || (directoryStat.mode & 0o022) !== 0) {
+      fail("El directorio de backups debe pertenecer a root y no permitir escritura ajena");
+    }
+    if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(values.deployment || "")) {
+      fail("Identificador de backup no válido");
+    }
     const target = path.join(backupRoot, `${values.deployment}.dump`);
+    // Refuse collisions/symlinks and keep database data private from creation.
+    const descriptor = fs.openSync(target, "wx", 0o600);
+    fs.closeSync(descriptor);
     if (backup.strategy === "pg_dump_local") {
       const args = ["--format=custom", "--file", target];
       if (backup.host) args.push("--host", backup.host);
@@ -530,6 +578,7 @@ async function runAction(action, values, app) {
       }
       await command(script, ["--output", target, "--deployment", values.deployment]);
     } else fail("Estrategia de backup no soportada");
+    fs.chmodSync(target, 0o600);
     const stat = fs.statSync(target);
     if (!stat.isFile() || stat.size === 0) fail("Backup vacío o inexistente");
     const checksumResult = await command("sha256sum", [target], { capture: true });
@@ -585,15 +634,18 @@ async function authorizeObservability(values, policy) {
   process.stdout.write(`${JSON.stringify({ application: slug, strategy, allowedActions })}\n`);
 }
 
-const { action, values } = parseArguments(process.argv.slice(2));
-if (process.getuid?.() !== 0) fail("El helper privilegiado debe ejecutarse como root");
-if (!SAFE_SLUG.test(values.application || "")) fail("Slug de aplicación no válido");
-const policy = readPolicy();
-if (action === "authorize-observability") {
-  authorizeObservability(values, policy).catch((error) => fail(error.message, 1));
-} else {
-  const application = policy.applications[values.application];
-  if (!application) fail("Aplicación no autorizada por la política");
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  const { action, values } = parseArguments(process.argv.slice(2));
+  if (process.getuid?.() !== 0) fail("El helper privilegiado debe ejecutarse como root");
+  if (!SAFE_SLUG.test(values.application || "")) fail("Slug de aplicación no válido");
+  const policy = readPolicy();
+  if (action === "authorize-observability") {
+    authorizeObservability(values, policy).catch((error) => fail(error.message, 1));
+  } else {
+    const application = policy.applications[values.application];
+    if (!application) fail("Aplicación no autorizada por la política");
 
-  runAction(action, values, application).catch((error) => fail(error.message, 1));
+    runAction(action, values, application).catch((error) => fail(error.message, 1));
+  }
+
 }
