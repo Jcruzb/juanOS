@@ -1,3 +1,4 @@
+import ProjectConfiguration from "./ProjectConfiguration.jsx";
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useLocation, useNavigate } from "react-router-dom";
@@ -608,6 +609,15 @@ function DeploymentsView({ projects, initialProjectId = "", initialOperation = "
       {createPlan.error && <div className="form-error">{createPlan.error.message}</div>}
       {pendingPlan && <section className="plan-review">
         <header><div><span className="eyebrow">Plan inmutable</span><h2>Revisa antes de ejecutar</h2></div><code>{pendingPlan.planHash.slice(0, 12)}</code></header>
+        <section className="plan-version" aria-label="Versión revisada del despliegue">
+          <h3>Versión incluida en este plan</h3>
+          <dl>
+            <div><dt>Rama destino</dt><dd><code>{pendingPlan.plan.targetBranch || "No informada"}</code></dd></div>
+            <div><dt>Commit destino fijado</dt><dd><code title={pendingPlan.plan.targetCommitSha || undefined}>{pendingPlan.plan.targetCommitSha || "No fijado para esta operación"}</code></dd></div>
+            <div><dt>Versión de origen</dt><dd>{pendingPlan.plan.sourceBranch || "Sin rama local"} · <code title={pendingPlan.plan.sourceCommitSha || undefined}>{pendingPlan.plan.sourceCommitSha?.slice(0, 12) || "Sin commit local"}</code></dd></div>
+          </dl>
+          {pendingPlan.plan.targetCommitSha && <p>La confirmación corresponde a este commit exacto, no a cambios posteriores de la rama.</p>}
+        </section>
         {pendingPlan.plan.isJuanOS && <p className="self-warning"><ShieldCheck size={16} /> JuanOS creará recovery antes de preparar su actualización.</p>}
         {pendingPlan.plan.warnings.map((warning) => <p className="warning-box" key={warning.code}><AlertTriangle size={15} /> {warning.message}</p>)}
         <ol>{pendingPlan.plan.steps.map((step) => <li key={step.stepKey}><span>{pendingPlan.plan.steps.indexOf(step) + 1}</span><div><strong>{step.name}</strong><small>{step.action}{step.requiresSudo ? " · requiere privilegios limitados" : ""}</small></div></li>)}</ol>
@@ -872,7 +882,7 @@ function ApplicationDetail({ projectId, projects, initialTab, initialOperation, 
     {tab === "logs" && <OperationalLogsPanel projectId={projectId} />}
     {tab === "variables" && <EnvironmentsView projects={projects} initialProjectId={projectId} />}
     {tab === "services" && <div className="service-grid">{(detail.data.services || []).map((service) => <article key={service.id}><Layers3 size={18} /><div><strong>{service.name}</strong><small>{service.serviceType} · {service.status}</small><code>{service.workingDirectory}</code></div></article>)}</div>}
-    {tab === "config" && <div className="detail-summary"><article><h3>Estrategia</h3><pre>{JSON.stringify(application.strategyConfig || {}, null, 2)}</pre></article><article><h3>Repositorio</h3><dl><div><dt>URL</dt><dd>{application.repositoryUrl}</dd></div><div><dt>Rama</dt><dd>{application.defaultBranch}</dd></div><div><dt>Ruta</dt><dd>{application.localPath}</dd></div></dl></article></div>}
+    {tab === "config" && <ProjectConfiguration key={application.id} application={application} services={detail.data.services || []} />}
     {tab === "terminal" && <TerminalView projects={projects} initialProjectId={projectId} />}
     {tab === "files" && <FilesView projects={projects} initialProjectId={projectId} />}
   </section>;

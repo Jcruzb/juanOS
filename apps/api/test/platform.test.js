@@ -75,6 +75,8 @@ test("genera un plan JuanOS inmutable con recovery antes de modificar", () => {
     slug: "juanos",
     defaultBranch: "main",
     currentCommit: "a".repeat(40),
+    currentBranch: "main",
+    targetCommit: "b".repeat(40),
     strategy: "docker_compose",
     isJuanOS: true,
     healthCheck: { url: "https://juanos.example.test/api/health", expectedStatus: 200, timeoutMs: 5000, retries: 3 }
@@ -87,7 +89,7 @@ test("genera un plan JuanOS inmutable con recovery antes de modificar", () => {
 
 test("rechaza comandos arbitrarios dentro de un plan", () => {
   assert.throws(() => assertSafeDeploymentPlan({
-    version: 1,
+    version: 2,
     isJuanOS: false,
     operation: "deploy",
     steps: [{ stepKey: "bad", name: "Bad", action: "application_operation", input: { command: "rm -rf /" } }]
@@ -282,6 +284,8 @@ test("genera pasos nativos para static, PM2, systemd, Docker y Compose", () => {
     slug: "sample",
     defaultBranch: "main",
     currentCommit: "a".repeat(40),
+    currentBranch: "main",
+    targetCommit: "b".repeat(40),
     repositoryExists: true,
     applicationType: "backend",
     isJuanOS: false,
@@ -301,7 +305,7 @@ test("genera pasos nativos para static, PM2, systemd, Docker y Compose", () => {
       strategy,
       applicationType,
       strategyConfig: strategy === "systemd"
-        ? { serviceName: "sample.service", pythonVenv: "venv" }
+        ? { serviceName: "sample.service", pythonVenv: "venv", backupStrategy: "pg_dump_local" }
         : {}
     }, "deploy");
     assert.equal(plan.steps.some((item) => item.action === expectedAction), true, strategy);

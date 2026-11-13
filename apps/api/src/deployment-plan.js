@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 
-export const DEPLOYMENT_PLAN_VERSION = 1;
+export const DEPLOYMENT_PLAN_VERSION = 2;
 export const PLAN_ACTIONS = new Set([
   "recovery_snapshot",
   "recovery_verify",
@@ -10,7 +10,7 @@ export const PLAN_ACTIONS = new Set([
   "git_status",
   "git_fetch",
   "git_compare",
-  "git_pull",
+  "git_fast_forward",
   "package_install",
   "package_build",
   "python_install",
@@ -50,6 +50,21 @@ export function deploymentPlanHash(plan) {
   return crypto.createHash("sha256").update(JSON.stringify(stableValue(plan))).digest("hex");
 }
 
+export function assertNormalizedApplication(application, operation = "update") {
+  const config = application.strategyConfig || {};
+  const codeMutation = ["deploy", "update", "repair"].includes(operation);
+  const needsStrategy = codeMutation || ["restart", "rollback"].includes(operation);
+  if ((needsStrategy && !["static_nginx", "pm2", "systemd", "docker", "docker_compose"].includes(application.strategy))
+      || (codeMutation && (config.importedFrom || config.legacy) && !config.configurationReviewedAt)) {
+    throw Object.assign(new Error("La aplicación importada requiere revisar y guardar su configuración antes de generar un plan."), { code: "APPLICATION_CONFIGURATION_REQUIRED", status: 409 });
+  }
+}
+
+export function deploymentConfigurationHash(application) {
+  const keys = ["id", "slug", "localPath", "defaultBranch", "repositoryUrl", "applicationType", "strategy", "strategyConfig", "serviceName", "isJuanOS", "domain", "healthCheck"];
+  return deploymentPlanHash(Object.fromEntries(keys.map((key) => [key, application[key] ?? null])));
+}
+
 function step(stepKey, name, action, input = {}, requiresSudo = false) {
   return { stepKey, name, action, input, requiresSudo };
 }
@@ -58,6 +73,7 @@ export function buildDeploymentPlan(application, operation) {
   if (!["deploy", "update", "repair", "restart", "ssl_test", "recovery", "recovery_test", "rollback"].includes(operation)) {
     throw Object.assign(new Error("Operación no soportada"), { code: "UNSUPPORTED_OPERATION" });
   }
+  assertNormalizedApplication(application, operation);
   const steps = [];
   const warnings = [];
   const isUpdateLike = operation === "deploy" || operation === "update" || operation === "repair";
@@ -123,16 +139,19 @@ export function buildDeploymentPlan(application, operation) {
     if (application.repositoryExists === false) {
       steps.push(step("git-clone", "Clonar repositorio", "git_clone", {
         repositoryUrl: application.repositoryUrl,
-        branch: application.defaultBranch
+        branch: application.defaultBranch,
+        targetCommit: application.targetCommit
       }));
     } else {
       steps.push(step("git-status", "Comprobar cambios locales", "git_status"));
-      steps.push(step("git-fetch", "Actualizar referencias remotas", "git_fetch"));
+      steps.push(step("git-fetch", "Actualizar referencias remotas", "git_fetch", { branch: application.defaultBranch, targetCommit: application.targetCommit }));
       steps.push(step("git-compare", "Comparar commits", "git_compare", {
-        branch: application.defaultBranch
+        branch: application.defaultBranch,
+        targetCommit: application.targetCommit
       }));
-      steps.push(step("git-pull", "Actualizar copia de trabajo", "git_pull", {
-        branch: application.defaultBranch
+      steps.push(step("git-advance", "Avanzar al commit revisado", "git_fast_forward", {
+        branch: application.defaultBranch,
+        targetCommit: application.targetCommit
       }));
     }
   }
@@ -163,7 +182,12 @@ function finalizePlan(application, operation, steps, warnings) {
     applicationSlug: application.slug,
     operation,
     strategy: application.strategy,
+    configurationHash: deploymentConfigurationHash(application),
+    repositoryExists: application.repositoryExists !== false,
+    repositoryOrigin: application.repositoryOrigin || null,
+    sourceBranch: application.currentBranch || null,
     sourceCommitSha: application.currentCommit || null,
+    targetCommitSha: ["deploy", "update", "repair"].includes(operation) ? application.targetCommit : null,
     targetBranch: application.defaultBranch,
     isJuanOS: Boolean(application.isJuanOS),
     warnings,
@@ -228,7 +252,10 @@ function appendStrategySteps(steps, application, operation) {
       venv: config.pythonVenv || "venv",
       requirements: config.requirements || "requirements.txt"
     }));
-    if (config.backupStrategy && config.backupStrategy !== "none") {
+    if (!["pg_dump_local", "docker_exec_pg_dump", "custom_script"].includes(config.backupStrategy)) {
+      throw Object.assign(new Error("Las migraciones Django requieren configurar un backup verificable antes de generar el plan."), { code: "DATABASE_BACKUP_REQUIRED", status: 409 });
+    }
+    {
       steps.push(step("database-backup", "Crear backup previo de base de datos", "database_backup", {
         strategy: config.backupStrategy
       }, config.backupStrategy !== "pg_dump_local"));
@@ -342,7 +369,7 @@ function appendHealthStep(steps, warnings, healthCheck) {
 
 export function assertSafeDeploymentPlan(plan) {
   if (!plan || plan.version !== DEPLOYMENT_PLAN_VERSION || !Array.isArray(plan.steps) || !plan.steps.length) {
-    throw Object.assign(new Error("Plan no válido"), { code: "INVALID_PLAN" });
+    throw Object.assign(new Error("Plan obsoleto o no válido. Genera y confirma un nuevo plan."), { code: "INVALID_PLAN" });
   }
   const keys = new Set();
   for (const current of plan.steps) {
@@ -356,6 +383,19 @@ export function assertSafeDeploymentPlan(plan) {
       throw Object.assign(new Error("El plan contiene comandos arbitrarios"), { code: "UNSAFE_PLAN_INPUT" });
     }
     keys.add(current.stepKey);
+  }
+  if (!/^[a-f0-9]{64}$/.test(plan.configurationHash || "")) throw Object.assign(new Error("Falta la configuración revisada"), { code: "INVALID_PLAN" });
+  if (["deploy", "update", "repair"].includes(plan.operation)) {
+    if (!/^[a-f0-9]{40}$/.test(plan.targetCommitSha || "") || (plan.repositoryExists && (!/^[a-f0-9]{40}$/.test(plan.sourceCommitSha || "") || plan.sourceBranch !== plan.targetBranch))) {
+      throw Object.assign(new Error("El plan requiere la rama real y un commit objetivo concreto"), { code: "INVALID_PLAN_TARGET" });
+    }
+    for (const item of plan.steps.filter((item) => ["git_clone", "git_fetch", "git_compare", "git_fast_forward"].includes(item.action))) {
+      if (item.input.targetCommit !== plan.targetCommitSha || item.input.branch !== plan.targetBranch) throw Object.assign(new Error("El paso Git no coincide con el commit revisado"), { code: "INVALID_PLAN_TARGET" });
+    }
+  }
+  const migration = plan.steps.findIndex((item) => item.action === "django_migrate");
+  if (migration >= 0 && !plan.steps.slice(0, migration).some((item) => item.action === "database_backup" && ["pg_dump_local", "docker_exec_pg_dump", "custom_script"].includes(item.input.strategy))) {
+    throw Object.assign(new Error("La migración requiere un backup previo verificable"), { code: "DATABASE_BACKUP_REQUIRED" });
   }
   if (plan.isJuanOS && ["deploy", "update", "repair"].includes(plan.operation)) {
     if (plan.steps[0].action !== "recovery_snapshot" || !plan.steps.some((item) => item.action === "self_update")) {
