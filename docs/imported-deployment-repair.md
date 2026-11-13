@@ -1,6 +1,6 @@
 # Reparación de aplicaciones importadas — 13 noviembre 2026
 
-ControlAnts no se despliega en esta reparación. Sus ramas de integración y PR siguen separados de main.
+La reparación de JuanOS se completó antes del despliegue de ControlAnts. Posteriormente el usuario autorizó ese despliegue, registrado al final. Sus ramas de integración y PR siguen separados de main.
 
 La inspección inicial de rutas se corrigió con `stat` y `findmnt`: `/srv/juanos/projects/controlants-backend` es un bind mount de `/var/www/controlants/backend/back_controlAnts2.0`; ambas rutas identifican el mismo directorio. El frontend también está montado desde `/var/www/controlants/frontend/front_ControlAnts2.0`. No se necesita reubicar el backend.
 
@@ -45,7 +45,7 @@ La versión `837bf6973b6f9a90529433727c6a9d9b6c68f190` quedó activa en `/opt/ju
 
 Respaldo JuanOS privado: `/var/backups/juanos/20261113-before-import-repair`, con dump adicional inmediatamente antes de activar, configuración y etiquetas Docker `before-import-repair-20261113`. Release previa conservada: `93a424bf9cc72c1adffbcd589cc4a69960911632`. Para rollback de software: detener worker, restaurar symlink a esa release, restaurar helper respaldado, reasignar imágenes preservadas a etiquetas api/web y recrear solo api/web con `--no-build`; iniciar worker y verificar salud. No restaurar la BD automáticamente. Esa primera activación no añadía migraciones; la corrección posterior de terminales añade la migración007 descrita abajo.
 
-La restricción inicial sobre ampliar permisos y excluir archivos quedó superada por la autorización explícita posterior del usuario; se aplicaron únicamente los cambios concretos descritos arriba. No quedan pendientes esas aprobaciones. Las mejoras funcionales de ControlAnts continúan pospuestas y sus planes no se han ejecutado.
+La restricción inicial sobre ampliar permisos y excluir archivos quedó superada por la autorización explícita posterior del usuario; se aplicaron únicamente los cambios concretos descritos arriba. No quedan pendientes esas aprobaciones. En esa fase las mejoras de ControlAnts seguían pospuestas; después fueron autorizadas y desplegadas, como se registra al final.
 
 ## Terminal lifecycle repair (2026-11-13)
 
@@ -89,8 +89,18 @@ now kills that PTY and ends its row instead of leaving an unreachable active ses
 
 Versión instalada: `bbe5bad26e2c5f8c37d74c1e4eec55db01e98d55`. **Validación final E2E completada**. La API arrancó el 2026-11-13 a las 14:08:14.468776453Z; desde el panel se abrió una terminal backend a las 14:08:37, se ejecutó una salida diferida con `sleep 5` y `printf` y se navegó a configuración. Tras esperar más de 20 segundos, la sesión del propietario 1 quedó finalizada automáticamente a las 14:09:03. La API mantuvo su hora de arranque y contador de reinicios 0, saludable.
 
-JuanOS `/api/health` respondió correctamente, el worker y `controlants-gunicorn` siguen activos y ControlAnts `/login` respondió HTTP200. Se conservaron las configuraciones revisadas de frontend y backend. No se desplegaron las mejoras de ControlAnts ni se fusionó ninguna rama con main.
+JuanOS `/api/health` respondió correctamente, el worker y `controlants-gunicorn` siguen activos y ControlAnts `/login` respondió HTTP200. Se conservaron las configuraciones revisadas de frontend y backend. En esa verificación de JuanOS aún no se habían desplegado las mejoras de ControlAnts. No se fusionó ninguna rama con main.
 
 Antes de instalar se prepararon `database-before-terminal-fix.dump` y la imagen de recuperación `juanos-api:before-terminal-fix-20261113`. La migración007 es aditiva: incorpora propietarios de terminales y una referencia opcional en las sesiones existentes. Para revertir el software, recuperar la release y la imagen API previas conservadas, manteniendo ese esquema adicional. **No eliminar columnas/tablas ni restaurar automáticamente la BD**: el software previo tolera las adiciones y restaurar el dump podría borrar operaciones posteriores. Usar el respaldo de BD solo mediante un procedimiento separado que contemple esos datos.
 
 Se respaldaron y marcaron como finalizadas únicamente siete sesiones legacy de ControlAnts anteriores al reinicio de API observado, tras comprobar que no quedaban sus PTY. Se conservaron el historial, las sesiones de otros proyectos y las filas posteriores. Las filas legacy restantes no se cierran automáticamente.
+
+## Preparación final del worker y despliegue posterior de ControlAnts
+
+Tras la autorización explícita del usuario, JuanOS completó los despliegues de backend `4122aa1` y frontend `677c5cd`, sin fusionar main. El ensayo Django en producción aprobó 86 comprobaciones con dos familias sintéticas y reversión completa de sus registros, sin llamadas a IA externa. Se corrigió únicamente una secuencia histórica atrasada de `auth_user`, avanzándola de 2 a 3 bajo bloqueo de tabla, sin modificar datos existentes.
+
+Para que `webterminal` reconozca los repositorios gestionados se registraron entradas `safe.directory` exactas para `/srv/juanos/projects/controlants-backend` y `/srv/juanos/projects/controlants-frontend`. No se autorizó un comodín ni se desactivaron las comprobaciones de propiedad de Git.
+
+El worker utiliza `NPM_CONFIG_CACHE=/var/lib/juanos/npm-cache` en `worker.env`, con una caché escribible específica del servicio. El entorno previo se conserva en `/var/backups/juanos/20261113-before-import-repair/worker-before-npm-cache.env`. No se relajó el aislamiento del servicio ni se ejecutó npm como root para eludir el problema.
+
+Respaldo ControlAnts previo al despliegue: `/var/backups/controlants/juanos/b6a34377-79a7-4ee8-b722-5d2f1c02016e.dump`,120313 bytes, índice verificado. Cualquier recuperación debe conservar las migraciones aditivas y datos posteriores; no restaurar la BD de forma automática. La comprobación final en navegador pasó: ingresos, financiación, lectura y borrador Nilo, Dashboard y Gastos cargan correctamente sin errores; se conservaron los datos existentes y no se confirmaron movimientos en el navegador. Release estática: `/var/www/controlants/frontend-releases/677c5cd4e944c8fdeba27c058367a1adb1079054`. Micrófono real no verificado.
