@@ -6,6 +6,7 @@ import request from "supertest";
 import { branchNameSchema, projectConfigurationPatchSchema, strategyConfigSchema, healthCheckSchema } from "@juanos/shared";
 import { createDatabase } from "../src/db.js";
 import { createApp } from "../src/app.js";
+import { createTerminalRuntime, reconcileTerminalOwners } from "../src/terminal-runtime.js";
 import { hashToken } from "../src/security.js";
 
 const timestamp = "2026-11-13T12:00:00.000Z";
@@ -104,6 +105,42 @@ test("configuration API PostgreSQL transaction and session integration", { skip:
       VALUES($1,$2,'main',$3,$4) RETURNING id`, [id, userId, "a".repeat(40), status]);
     return result.rows[0].id;
   }
+
+  await suite.test("runtime reconciliation preserves other live instances and legacy rows", async () => {
+    const id = await project();
+    const live = await createTerminalRuntime(db, () => {});
+    const deadClient = await db.connect();
+    let deadReleased = false;
+    try {
+      const dead = (await deadClient.query("INSERT INTO terminal_runtime_owners DEFAULT VALUES RETURNING id")).rows[0].id;
+      await deadClient.query("SELECT pg_advisory_lock($1,$2)", [1247104596, dead]);
+      const add = async owner => (await db.query(`INSERT INTO terminal_sessions(user_id,project_id,runtime_owner_id)
+        VALUES($1,$2,$3) RETURNING id`, [userId,id,owner])).rows[0].id;
+      const liveSession = await add(live.ownerId);
+      const deadSession = await add(dead);
+      const legacySession = await add(null);
+      assert.equal(await reconcileTerminalOwners(db), 0);
+      deadClient.release(true);
+      deadReleased = true;
+      // A fresh connection query observes the completed backend disconnect.
+      for (let attempt=0; attempt<20; attempt++) {
+        await reconcileTerminalOwners(db);
+        const row = (await db.query("SELECT status FROM terminal_sessions WHERE id=$1", [deadSession])).rows[0];
+        if (row.status === "ended") break;
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      const rows = (await db.query("SELECT id,status FROM terminal_sessions WHERE id=ANY($1::uuid[])", [[liveSession,deadSession,legacySession]])).rows;
+      const states = Object.fromEntries(rows.map(row => [row.id,row.status]));
+      assert.equal(states[deadSession], "ended");
+      assert.equal(states[liveSession], "active");
+      assert.equal(states[legacySession], "active");
+      await live.stop();
+      assert.equal((await db.query("SELECT status FROM terminal_sessions WHERE id=$1", [liveSession])).rows[0].status, "ended");
+    } finally {
+      if (!deadReleased) deadClient.release(true);
+      await live.stop();
+    }
+  });
 
   await suite.test("requires session and CSRF", async () => {
     const id = await project();

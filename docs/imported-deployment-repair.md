@@ -42,3 +42,37 @@ La versión `837bf6973b6f9a90529433727c6a9d9b6c68f190` quedó activa en `/opt/ju
 Respaldo JuanOS privado: `/var/backups/juanos/20261113-before-import-repair`, con dump adicional inmediatamente antes de activar, configuración y etiquetas Docker `before-import-repair-20261113`. Release previa conservada: `93a424bf9cc72c1adffbcd589cc4a69960911632`. Para rollback de software: detener worker, restaurar symlink a esa release, restaurar helper respaldado, reasignar imágenes preservadas a etiquetas api/web y recrear solo api/web con `--no-build`; iniciar worker y verificar salud. No restaurar la BD automáticamente: esta reparación no añade migraciones.
 
 Pendiente: nueva sesión del usuario para revisar configuración en el panel, confirmación para ampliar acciones host específicas de ControlAnts y decisión sobre archivos auxiliares. La revisión automática rechazó añadir exclusiones locales de Git sin autorización explícita; no se aplicaron. Se prepararon `host-policy.proposed.json` y un pgpass privado dentro del respaldo, pero la política activa permanece intacta. No se ha convertido todavía el frontend servido a releases ni desplegado mejoras de ControlAnts.
+
+## Terminal lifecycle repair (2026-11-13)
+
+A disconnected terminal could still produce PTY output. Comparing its state against
+`session.websocket.OPEN` dereferenced a null socket and crashed the API. The handler
+now compares against `WebSocket.OPEN`; regression coverage emits output after the
+WebSocket close event.
+
+Migration `007_terminal_runtime.sql` adds a runtime owner to new terminal sessions.
+Each API instance holds a dedicated PostgreSQL connection and a session advisory
+lock for its owner. Owner registration and lock acquisition occur before commit.
+At startup and every ten seconds, reconciliation ends sessions only when it can
+acquire that owner's lock. It preserves live owners from other API instances.
+This requires a direct/session-preserving PostgreSQL connection, not transaction
+pooling. One pool connection per API instance remains reserved for ownership.
+
+Graceful API shutdown kills its PTYs and ends its own rows before closing the DB.
+Connection loss disables terminal creation and kills local PTYs. Failed PTY creation
+and failed opening audit also close their new session records. HTTP diagnostics
+remain available if terminal initialization fails.
+
+Legacy rows have no runtime owner and are deliberately excluded from automatic
+reconciliation. Before manually marking a legacy row ended, back it up and verify
+that its owning pre-upgrade API and PTY no longer exist. Scope updates to reviewed
+session IDs with `status='active'` and a verified restart cutoff; preserve history,
+other projects and newer sessions. Age alone does not prove abandonment.
+
+Validation: full `npm test` completed with **65 passed, 1 skipped, 0 failed**;
+API typecheck, changed-file ESLint and `git diff --check` passed. The skipped suite
+requires an explicit `JUANOS_TEST_DATABASE_URL` whose database name starts with
+`juanos_config_test_`. Its new PostgreSQL test verifies that live owners and legacy
+rows remain active while a disconnected owner's sessions are recovered. This new
+SQL test has **not yet run on PostgreSQL 17** and must pass in an isolated database
+before deploying this candidate. It creates and removes only its random test schema.

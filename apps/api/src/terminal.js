@@ -1,6 +1,7 @@
-import { WebSocketServer } from "ws";
+import { WebSocket, WebSocketServer } from "ws";
 import pty from "node-pty";
 import { parse as parseCookie } from "cookie";
+import { createTerminalRuntime } from "./terminal-runtime.js";
 import { hashToken } from "./security.js";
 
 const MAX_INPUT_BYTES = 64 * 1024;
@@ -26,13 +27,34 @@ export function terminalOptions(localPath, projectId) {
   };
 }
 
-export function attachTerminalServer(server, { db, config, ptyImpl = pty }) {
+export function attachTerminalServer(server, { db, config, ptyImpl = pty, runtimeFactory = createTerminalRuntime }) {
   const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_INPUT_BYTES });
+
+  const sessions = new Map();
+  let stopping = false;
+  const killSessions = () => {
+    stopping = true;
+    for (const session of sessions.values()) {
+      if (session.disconnectTimer) clearTimeout(session.disconnectTimer);
+      session.websocket?.terminate();
+      try { session.terminal.kill("SIGKILL"); } catch { /* PTY already exited. */ }
+    }
+  };
+  const runtimeReady = runtimeFactory(db, killSessions);
+  // Startup failure disables terminals; HTTP remains available for diagnostics.
+  void runtimeReady.catch(() => { stopping = true; });
+  wss.stopTerminals = async () => {
+    killSessions();
+    const runtime = await runtimeReady.catch(() => null);
+    await runtime?.stop();
+  };
 
   server.on("upgrade", async (request, socket, head) => {
     try {
       const url = new URL(request.url, config.APP_ORIGIN);
       if (url.pathname !== "/ws/terminal") return;
+      const runtime = await runtimeReady;
+      if (stopping || !runtime.active) return socket.destroy();
       if (!isAllowedWsOrigin(request.headers.origin, config.APP_ORIGIN)) return socket.destroy();
       const cookies = parseCookie(request.headers.cookie || "");
       const token = cookies.juanos_session;
@@ -56,10 +78,10 @@ export function attachTerminalServer(server, { db, config, ptyImpl = pty }) {
     }
   });
 
-  const sessions = new Map();
-
   wss.on("connection", (websocket, request) => {
     void (async () => {
+    const runtime = await runtimeReady;
+    if (stopping || !runtime.active) { websocket.close(1011, "terminal unavailable"); return; }
     const context = request.juanos;
     let session = request.resumeId ? sessions.get(request.resumeId) : null;
     if (session && (session.userId !== context.user_id || session.projectId !== context.project_id)) session = null;
@@ -72,12 +94,19 @@ export function attachTerminalServer(server, { db, config, ptyImpl = pty }) {
       const shell = process.env.SHELL && ["/bin/bash", "/bin/zsh", "/bin/sh"].includes(process.env.SHELL)
         ? process.env.SHELL
         : "/bin/bash";
-      const terminal = ptyImpl.spawn(shell, ["--login"], terminalOptions(context.local_path, context.project_id));
       const created = await db.query(
-        `INSERT INTO terminal_sessions (user_id, project_id, remote_ip)
-         VALUES ($1, $2, $3) RETURNING id`,
-        [context.user_id, context.project_id, request.socket.remoteAddress]
+        `INSERT INTO terminal_sessions (user_id, project_id, remote_ip, runtime_owner_id)
+         VALUES ($1, $2, $3, $4) RETURNING id`,
+        [context.user_id, context.project_id, request.socket.remoteAddress, runtime.ownerId]
       );
+      let terminal;
+      try {
+        if (stopping || !runtime.active) throw new Error("terminal runtime stopped");
+        terminal = ptyImpl.spawn(shell, ["--login"], terminalOptions(context.local_path, context.project_id));
+      } catch (error) {
+        await db.query("UPDATE terminal_sessions SET status='ended',ended_at=now() WHERE id=$1", [created.rows[0].id]);
+        throw error;
+      }
       session = {
         id: created.rows[0].id,
         terminal,
@@ -88,18 +117,14 @@ export function attachTerminalServer(server, { db, config, ptyImpl = pty }) {
         outputBuffer: ""
       };
       sessions.set(session.id, session);
-      await db.query(
-        `INSERT INTO audit_logs (user_id, action, resource_type, resource_id, metadata, ip_address)
-         VALUES ($1, 'terminal.opened', 'terminal_session', $2, $3::jsonb, $4)`,
-        [context.user_id, session.id, JSON.stringify({ projectId: context.project_id }), request.socket.remoteAddress]
-      );
       terminal.onData((data) => {
         session.outputBuffer = (session.outputBuffer + data).slice(-100_000);
-        if (session.websocket?.readyState === session.websocket.OPEN) {
+        if (session.websocket?.readyState === WebSocket.OPEN) {
           session.websocket.send(JSON.stringify({ type: "output", data }));
         }
       });
       terminal.onExit(async () => {
+        session.ended = true;
         sessions.delete(session.id);
         if (session.disconnectTimer) clearTimeout(session.disconnectTimer);
         await db.query(
@@ -108,6 +133,18 @@ export function attachTerminalServer(server, { db, config, ptyImpl = pty }) {
         ).catch(() => {});
         session.websocket?.close(1000, "terminal ended");
       });
+      try {
+      await db.query(
+        `INSERT INTO audit_logs (user_id, action, resource_type, resource_id, metadata, ip_address)
+         VALUES ($1, 'terminal.opened', 'terminal_session', $2, $3::jsonb, $4)`,
+        [context.user_id, session.id, JSON.stringify({ projectId: context.project_id }), request.socket.remoteAddress]
+      );
+      } catch (error) {
+        terminal.kill("SIGKILL");
+        await db.query("UPDATE terminal_sessions SET status='ended',ended_at=now() WHERE id=$1", [session.id]);
+        throw error;
+      }
+      if (stopping || !runtime.active) { terminal.kill("SIGKILL"); websocket.close(1011, "terminal unavailable"); return; }
     } else if (session.disconnectTimer) {
       clearTimeout(session.disconnectTimer);
       session.disconnectTimer = null;
@@ -137,7 +174,7 @@ export function attachTerminalServer(server, { db, config, ptyImpl = pty }) {
       }
     });
     websocket.on("close", () => {
-      if (session.websocket !== websocket) return;
+      if (session.websocket !== websocket || session.ended || stopping) return;
       session.websocket = null;
       session.disconnectTimer = setTimeout(() => session.terminal.kill("SIGHUP"), 20_000);
       session.disconnectTimer.unref();

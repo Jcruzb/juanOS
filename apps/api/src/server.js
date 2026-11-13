@@ -14,7 +14,7 @@ const app = createApp({ db, config });
 const server = app.listen(config.PORT, "0.0.0.0", () => {
   process.stdout.write(JSON.stringify({ level: "info", message: "JuanOS API ready", port: config.PORT }) + "\n");
 });
-attachTerminalServer(server, { db, config });
+const terminalServer = attachTerminalServer(server, { db, config });
 attachDeploymentLogServer(server, { db, config });
 attachOperationalLogServer(server, { db, config });
 const stopDeploymentWorker = config.EMBEDDED_WORKER === "1"
@@ -29,6 +29,9 @@ const stopMaintenanceWorker = config.EMBEDDED_WORKER === "1"
 
 async function shutdown(signal) {
   process.stdout.write(JSON.stringify({ level: "info", message: "shutting down", signal }) + "\n");
+  await terminalServer.stopTerminals().catch(() => {
+    process.stderr.write(JSON.stringify({ level: "error", message: "terminal shutdown persistence failed" }) + "\n");
+  });
   await stopDeploymentWorker();
   await stopOperationalLogWorker();
   await stopMaintenanceWorker();
