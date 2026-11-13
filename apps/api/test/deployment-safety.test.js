@@ -127,3 +127,28 @@ test("rollback y restart permiten legacy sin el marcador pero exigen estrategia 
     assert.throws(() => buildDeploymentPlan({ ...application, strategy: null }, operation), { code: "APPLICATION_CONFIGURATION_REQUIRED" });
   }
 });
+
+
+test("Python del venv permite enlace a Python del sistema conservando su ruta de invocación", async (t) => {
+  const { resolveProjectExecutable } = await import("../src/deployment-worker.js");
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "juanos-venv-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const bin = path.join(root, "venv", "bin");
+  await fs.mkdir(bin, { recursive: true });
+  await fs.symlink("/usr/bin/python3", path.join(bin, "python3"));
+  await fs.symlink("python3", path.join(bin, "python"));
+  assert.equal(await resolveProjectExecutable(root, "venv", "python"), path.join(await fs.realpath(bin), "python"));
+  await fs.symlink("/usr/bin/python3", path.join(bin, "pip"));
+  await assert.rejects(resolveProjectExecutable(root, "venv", "pip"), /fuera/);
+  await fs.unlink(path.join(bin, "python"));
+  await fs.symlink("/bin/sh", path.join(bin, "python"));
+  await assert.rejects(resolveProjectExecutable(root, "venv", "python"), /fuera/);
+  await fs.unlink(path.join(bin, "python"));
+  const outside = path.join(root, "python3.12");
+  await fs.writeFile(outside, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  await fs.symlink(outside, path.join(bin, "python"));
+  await assert.rejects(resolveProjectExecutable(root, "venv", "python"), /fuera/);
+  await fs.rm(bin, { recursive: true });
+  await fs.symlink("/usr/bin", bin);
+  await assert.rejects(resolveProjectExecutable(root, "venv", "python"), /fuera/);
+});

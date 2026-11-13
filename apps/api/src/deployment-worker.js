@@ -660,12 +660,27 @@ async function resolveProjectDirectory(root, relativePath) {
   return target;
 }
 
-async function resolveProjectExecutable(workingDirectory, venv, name) {
+export async function resolveProjectExecutable(workingDirectory, venv, name) {
   const venvDirectory = await resolveProjectDirectory(workingDirectory, venv);
-  const executable = await resolveProjectFile(venvDirectory, `bin/${name}`);
-  const stat = await fs.stat(executable);
-  if ((stat.mode & 0o111) === 0) throw new Error(`El ejecutable ${name} no tiene permisos de ejecución`);
-  return executable;
+  const binDirectory = await resolveProjectDirectory(venvDirectory, "bin");
+  const invocationPath = path.join(binDirectory, name);
+  const target = await fs.realpath(invocationPath);
+  const stat = await fs.stat(target);
+  const contained = target.startsWith(`${venvDirectory}${path.sep}`);
+  if (!contained) {
+    const systemPython = name === "python"
+      && ["/usr/bin", "/usr/local/bin"].includes(path.dirname(target))
+      && /^python3(?:\.\d+)?$/.test(path.basename(target))
+      && stat.uid === 0 && (stat.mode & 0o022) === 0;
+    if (!systemPython) throw new Error("Archivo fuera de la aplicación");
+    const directoryStat = await fs.stat(path.dirname(target));
+    if (directoryStat.uid !== 0 || (directoryStat.mode & 0o022) !== 0) {
+      throw new Error("El directorio del intérprete Python no es seguro");
+    }
+  }
+  if (!stat.isFile() || (stat.mode & 0o111) === 0) throw new Error(`El ejecutable ${name} no tiene permisos de ejecución`);
+  // Preserve the venv invocation path so Python discovers pyvenv.cfg and its installed packages.
+  return invocationPath;
 }
 
 async function detectPackageManager(workingDirectory, configured) {

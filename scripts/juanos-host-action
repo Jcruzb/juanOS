@@ -281,6 +281,9 @@ export async function assertSystemdDeploymentTarget(app, run = command) {
 }
 
 export function assertStaticDeploymentTarget(app) {
+  if (!app.static?.releaseRoot || !app.static?.currentSymlink) {
+    throw new Error("Configura las rutas de releases y publicación estática en la política del host");
+  }
   const releaseRoot = realDirectory(app.static?.releaseRoot, "releaseRoot");
   const current = app.static?.currentSymlink;
   if (!path.isAbsolute(current || "") || !current.startsWith(`${path.dirname(releaseRoot)}${path.sep}`)) {

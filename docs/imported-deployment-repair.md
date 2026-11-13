@@ -28,3 +28,9 @@ La política root-owned no se edita desde la API. Para habilitar despliegues hab
 ## Estado de respaldo previo
 
 ControlAnts: `/var/backups/controlants/20261113-083234-pre-release` contiene dump PostgreSQL y configuración/frontend actuales. Índice del dump comprobado, carpeta0700 y dump0600. Restauración real todavía no ensayada; los ensayos previos usaron datos demo. Crear un respaldo nuevo antes del eventual despliegue de ControlAnts, pues puede haber nuevas operaciones desde esta copia.
+
+## Validación en VPS
+
+Commit inicial a73b59c compilado en release aislada sin activar. En PostgreSQL17 se creó exclusivamente `juanos_config_test_20261113_repair`; los11 tests de configuración y sesión/CSRF pasaron, incluido rollback transaccional y concurrencia. El test eliminó su propio esquema temporal. La BD de producción no participó.
+
+También se corrigió la ejecución de Python de entornos virtuales: admite enlaces seguros al intérprete del sistema y conserva la ruta del venv para cargar sus paquetes.
