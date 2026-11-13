@@ -34,3 +34,11 @@ ControlAnts: `/var/backups/controlants/20261113-083234-pre-release` contiene dum
 Commit inicial a73b59c compilado en release aislada sin activar. En PostgreSQL17 se creó exclusivamente `juanos_config_test_20261113_repair`; los11 tests de configuración y sesión/CSRF pasaron, incluido rollback transaccional y concurrencia. El test eliminó su propio esquema temporal. La BD de producción no participó.
 
 También se corrigió la ejecución de Python de entornos virtuales: admite enlaces seguros al intérprete del sistema y conserva la ruta del venv para cargar sus paquetes.
+
+## Activación de JuanOS
+
+La versión `837bf6973b6f9a90529433727c6a9d9b6c68f190` quedó activa en `/opt/juanos/current`, sin merge a main. API/web Docker saludables y worker activo; helper instalado con checksum idéntico al de la release. JuanOS `/api/health` y ControlAnts `/login` respondieron200. ControlAnts conserva su código y migraciones anteriores.
+
+Respaldo JuanOS privado: `/var/backups/juanos/20261113-before-import-repair`, con dump adicional inmediatamente antes de activar, configuración y etiquetas Docker `before-import-repair-20261113`. Release previa conservada: `93a424bf9cc72c1adffbcd589cc4a69960911632`. Para rollback de software: detener worker, restaurar symlink a esa release, restaurar helper respaldado, reasignar imágenes preservadas a etiquetas api/web y recrear solo api/web con `--no-build`; iniciar worker y verificar salud. No restaurar la BD automáticamente: esta reparación no añade migraciones.
+
+Pendiente: nueva sesión del usuario para revisar configuración en el panel, confirmación para ampliar acciones host específicas de ControlAnts y decisión sobre archivos auxiliares. La revisión automática rechazó añadir exclusiones locales de Git sin autorización explícita; no se aplicaron. Se prepararon `host-policy.proposed.json` y un pgpass privado dentro del respaldo, pero la política activa permanece intacta. No se ha convertido todavía el frontend servido a releases ni desplegado mejoras de ControlAnts.
